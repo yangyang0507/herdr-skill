@@ -51,6 +51,8 @@ Use a `herdr-msg` header for every agent-to-agent request, reply, or update:
 
 The header gives the receiver enough metainfo to reply without making you poll their pane. The `reply-to` value must be a current pane or agent target that can receive the response.
 
+For agent prompts, submit with `scripts/herdr-msg` or `herdr pane run`. Do not use `herdr agent send` for task handoff unless you also intentionally press Enter afterward; `agent send` writes literal text only.
+
 Use the bundled helper when available:
 
 ```bash
@@ -65,7 +67,8 @@ MSG
 Manual form:
 
 ```bash
-herdr agent send codex "[herdr-msg from:codex pane:w1-1 reply-to:w1-1 at:w1/w1:1 kind:request task:auth-review]
+TARGET_PANE=$(herdr agent get codex | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
+herdr pane run "$TARGET_PANE" "[herdr-msg from:codex pane:w1-1 reply-to:w1-1 at:w1/w1:1 kind:request task:auth-review]
 Review src/auth.ts. Reply with DONE or BLOCKED to reply-to."
 ```
 
@@ -140,7 +143,7 @@ For tests, wait for a test-framework marker such as `test result`, `passed`, `fa
 
 - `pane read --source recent` is rendered text; `recent-unwrapped` is better for matching copied command output.
 - `pane run` submits text with Enter. `pane send-text` types only; use `pane send-keys` for Enter or special keys.
-- `agent send` targets detected agents by terminal ID, unique agent name, detected label, or legacy pane ID.
+- `agent send` targets detected agents but only writes literal text. For agent tasks, prefer `scripts/herdr-msg` or resolve the target pane and use `pane run`.
 - Herdr injects `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_PANE_ID` into pane processes. `HERDR_PANE_ID` may look like `p_123`; pane and agent APIs accept it.
 - `herdr agent wait --status idle` treats both `idle` and `done` as completion. It rejects `done` because `done` is a UI attention state.
 - If an agent is already working, keep the message short and say whether it should answer now or after its current step.

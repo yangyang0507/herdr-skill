@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/herdr-msg <target> [--kind request|reply|update] [--task id] [--status text] [--] [message...]
 
-Sends a structured herdr-msg to another Herdr agent. Message text may be passed
-as arguments or on stdin.
+Sends and submits a structured herdr-msg to another Herdr agent. Message text
+may be passed as arguments or on stdin.
 EOF
 }
 
@@ -173,4 +173,16 @@ fi
 header="${header}]"
 
 payload="${header}"$'\n'"${body}"
-herdr agent send "$target" "$payload"
+target_info=$(herdr agent get "$target" 2>/dev/null || true)
+target_info_without_sessions=$(strip_simple_agent_session "$target_info")
+target_pane_id=$(json_string_field "$target_info_without_sessions" pane_id)
+if [[ -z "$target_pane_id" ]]; then
+  if herdr pane get "$target" >/dev/null 2>&1; then
+    target_pane_id="$target"
+  else
+    echo "error: could not resolve target agent or pane: $target" >&2
+    exit 1
+  fi
+fi
+
+herdr pane run "$target_pane_id" "$payload"

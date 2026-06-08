@@ -76,7 +76,7 @@ uv run --with pyyaml python /path/to/quick_validate.py herdr
 
 ## 设计说明
 
-`herdr/scripts/herdr-msg` 会发送类似这样的消息：
+`herdr/scripts/herdr-msg` 会发送并提交类似这样的消息：
 
 ```text
 [herdr-msg from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]

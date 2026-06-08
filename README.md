@@ -78,7 +78,7 @@ Runtime behavior that touches live panes should only be tested from inside Herdr
 
 ## Design Notes
 
-`herdr/scripts/herdr-msg` sends messages like:
+`herdr/scripts/herdr-msg` sends and submits messages like:
 
 ```text
 [herdr-msg from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]

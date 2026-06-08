@@ -48,6 +48,8 @@ Targets accept terminal IDs, unique agent names, detected or reported agent labe
 
 `agent wait --status idle` is the completion wait for agent targets: it returns when the target becomes `idle` or `done`. `agent wait --status done` is rejected because `done` is a UI attention state.
 
+`agent send` writes literal text only. It does not submit Enter. For agent-to-agent task handoff, use `scripts/herdr-msg` or resolve the target pane and use `pane run`.
+
 ## Pane Commands
 
 ```bash
@@ -185,9 +187,10 @@ If `scripts/herdr-msg` is unavailable, create a message manually and pass it as 
 
 ```bash
 SELF=${HERDR_PANE_ID:-$(herdr pane list | sed -nE 's/.*\{[^{}]*"focused":true[^{}]*"pane_id":"([^"]+)".*/\1/p')}
+TARGET_PANE=$(herdr agent get reviewer | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
 MSG="[herdr-msg from:codex pane:$SELF reply-to:$SELF at:current kind:request task:review]
 Please review src/api. Reply to reply-to with DONE or BLOCKED."
-herdr agent send reviewer "$MSG"
+herdr pane run "$TARGET_PANE" "$MSG"
 ```
 
 Avoid shell one-liners with complex quoting. Use a variable, heredoc, or `scripts/herdr-msg` for multi-line messages.
