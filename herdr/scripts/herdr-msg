@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/herdr-msg <target> [--kind request|reply|update] [--task id] [--status text] [--] [message...]
+
+Sends a structured herdr-msg to another Herdr agent. Message text may be passed
+as arguments or on stdin.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 2
+fi
+
+if [[ "${HERDR_ENV:-}" != "1" ]]; then
+  echo "error: HERDR_ENV is not 1; refusing to control live Herdr panes" >&2
+  exit 2
+fi
+
+target=$1
+shift
+kind="request"
+task="general"
+status=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kind)
+      kind="${2:?missing value for --kind}"
+      shift 2
+      ;;
+    --task)
+      task="${2:?missing value for --task}"
+      shift 2
+      ;;
+    --status)
+      status="${2:?missing value for --status}"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "error: unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -gt 0 ]]; then
+  body="$*"
+elif [[ ! -t 0 ]]; then
+  body=$(cat)
+else
+  echo "error: message body required on argv or stdin" >&2
+  exit 2
+fi
+
+clean_header_value() {
+  local text="${1:-unknown}"
+  text="${text//]/-}"
+  text="${text//[[:space:]]/-}"
+  while [[ "$text" == *--* ]]; do
+    text="${text//--/-}"
+  done
+  while [[ "$text" == -* ]]; do
+    text="${text#-}"
+  done
+  while [[ "$text" == *- ]]; do
+    text="${text%-}"
+  done
+  if [[ -z "$text" ]]; then
+    text="unknown"
+  fi
+  printf '%s' "$text"
+}
+
+json_string_field() {
+  local json="$1"
+  local key="$2"
+  local pattern="\"${key}\":\"([^\"]*)\""
+  if [[ "$json" =~ $pattern ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+strip_simple_agent_session() {
+  local json="$1"
+  local pattern='"agent_session":\{[^{}]*\},?'
+  while [[ "$json" =~ $pattern ]]; do
+    json="${json/${BASH_REMATCH[0]}/}"
+  done
+  printf '%s' "$json"
+}
+
+pane_object_with_focused() {
+  local json="$1"
+  local pattern='\{[^{}]*"focused":true[^{}]*\}'
+  if [[ "$json" =~ $pattern ]]; then
+    printf '%s' "${BASH_REMATCH[0]}"
+  fi
+}
+
+pane_object_with_pane_id() {
+  local json="$1"
+  local pane_id="$2"
+  local pattern="\{[^{}]*\"pane_id\":\"${pane_id}\"[^{}]*\}"
+  if [[ "$json" =~ $pattern ]]; then
+    printf '%s' "${BASH_REMATCH[0]}"
+  fi
+}
+
+first_pane_object() {
+  local json="$1"
+  local pattern='\{[^{}]*"pane_id":"[^"]*"[^{}]*\}'
+  if [[ "$json" =~ $pattern ]]; then
+    printf '%s' "${BASH_REMATCH[0]}"
+  fi
+}
+
+info_json=$(herdr pane list)
+current_json=""
+if [[ -n "${HERDR_PANE_ID:-}" ]]; then
+  current_json=$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null || true)
+fi
+
+source_json="$current_json"
+info_without_sessions=$(strip_simple_agent_session "$info_json")
+if [[ -z "$(json_string_field "$source_json" pane_id)" && -n "${HERDR_PANE_ID:-}" ]]; then
+  source_json=$(pane_object_with_pane_id "$info_without_sessions" "$HERDR_PANE_ID")
+fi
+if [[ -z "$(json_string_field "$source_json" pane_id)" ]]; then
+  source_json=$(pane_object_with_focused "$info_without_sessions")
+fi
+if [[ -z "$(json_string_field "$source_json" pane_id)" ]]; then
+  source_json=$(first_pane_object "$info_without_sessions")
+fi
+
+resolved_agent=$(json_string_field "$source_json" agent)
+if [[ -z "$resolved_agent" ]]; then
+  resolved_agent=$(json_string_field "$source_json" label)
+fi
+if [[ -z "$resolved_agent" ]]; then
+  resolved_agent="agent"
+fi
+resolved_pane_id="${HERDR_PANE_ID:-$(json_string_field "$source_json" pane_id)}"
+resolved_workspace_id="${HERDR_WORKSPACE_ID:-$(json_string_field "$source_json" workspace_id)}"
+resolved_tab_id="${HERDR_TAB_ID:-$(json_string_field "$source_json" tab_id)}"
+
+agent_value=$(clean_header_value "${HERDR_AGENT_NAME:-$resolved_agent}")
+pane_value=$(clean_header_value "${resolved_pane_id:-unknown}")
+workspace_value=$(clean_header_value "${resolved_workspace_id:-unknown-workspace}")
+tab_value=$(clean_header_value "${resolved_tab_id:-unknown-tab}")
+kind_value=$(clean_header_value "$kind")
+task_value=$(clean_header_value "$task")
+
+header="[herdr-msg from:${agent_value} pane:${pane_value} reply-to:${pane_value} at:${workspace_value}/${tab_value} kind:${kind_value} task:${task_value}"
+if [[ -n "$status" ]]; then
+  header="${header} status:$(clean_header_value "$status")"
+fi
+header="${header}]"
+
+payload="${header}"$'\n'"${body}"
+herdr agent send "$target" "$payload"

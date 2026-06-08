@@ -1,0 +1,6 @@
+interface:
+  display_name: "Herdr"
+  short_description: "Coordinate Herdr panes and agents"
+  default_prompt: "Use $herdr to coordinate sibling agents, panes, and Herdr workspace tasks."
+policy:
+  allow_implicit_invocation: true
