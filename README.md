@@ -13,9 +13,11 @@ The original Herdr skill documents the CLI surface, but its coordination recipes
 This repo refines that behavior around a few defaults:
 
 - prefer `herdr agent list` and `herdr pane list` for discovery;
-- read concrete pane output before acting;
+- read concrete pane output **once** before acting (not a poll loop);
 - wait for named output markers, not vague completion state;
 - use structured agent messages with `reply-to` metadata;
+- treat a successful `herdr-msg` send as **DELIVERED**, then stop observing the target;
+- if synchronization is needed, wait on **SELF** for `kind:reply task:<id>` (or use `--wait-reply`);
 - continue local work instead of polling sibling agents;
 - keep detailed command reference behind progressive disclosure.
 
@@ -87,4 +89,17 @@ Review src/api and reply with DONE or BLOCKED.
 
 The receiver has enough metadata to reply directly to the sender. That avoids a common bad loop: sender sends work, waits for `done`, times out or blocks, then reads the target pane late.
 
-The skill still documents `agent wait` and `wait agent-status`, but treats them as fallback tools. The preferred synchronization point is either a concrete output marker or a structured reply.
+After a successful send the helper prints a key=value **receipt** (`state=delivered`, `match=...`, `hint=...`) so the caller knows the message landed and what to do next. Optional flags:
+
+| Flag | Role |
+|------|------|
+| `--verify` | One-shot delivery check on the target pane (not task completion). |
+| `--wait-reply` | Block on the sender pane until `kind:reply task:<id>` appears. |
+| `--timeout` / `--verify-timeout` | Millisecond timeouts for the above. |
+| `--dry-run` | Print payload and receipt without sending. |
+
+Exit codes: `0` ok, `1` send/resolve fail, `2` usage/env, `3` verify failed, `4` wait-reply timeout.
+
+The intended post-send protocol is: **deliver → stop polling the target → continue local work or wait on self**. Repeated `agent read` / `pane read` of the worker after send is treated as a protocol violation in the skill.
+
+The skill still documents `agent wait` and `wait agent-status`, but treats them as fallback tools. The preferred synchronization point is either a concrete output marker or a structured reply on the sender's own pane.

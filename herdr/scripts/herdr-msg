@@ -3,10 +3,38 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/herdr-msg <target> [--kind request|reply|update] [--task id] [--status text] [--] [message...]
+Usage: scripts/herdr-msg <target> [options] [--] [message...]
 
 Sends and submits a structured herdr-msg to another Herdr agent. Message text
 may be passed as arguments or on stdin.
+
+Options:
+  --kind request|reply|update   Message kind (default: request)
+  --task id                     Task id for correlation (default: general)
+  --status text                 Optional status field in the header
+  --verify                      Confirm delivery once on the target pane, then stop
+  --wait-reply                  After send, wait on SELF for kind:reply task:<id>
+  --timeout MS                  Timeout for --wait-reply (default: 60000)
+  --verify-timeout MS           Timeout for --verify (default: 5000)
+  --dry-run                     Resolve targets and print payload; do not send
+  --quiet                       Suppress the key=value receipt on stdout
+  -h, --help                    Show this help
+
+Receipt (stdout, unless --quiet):
+  ok / state / task / kind / target / target_pane / from / reply_to / match / verified / hint
+
+Exit codes:
+  0  success (delivered, and optional wait/verify ok)
+  1  send or resolve failure
+  2  usage or environment error
+  3  --verify failed (message not observed on target)
+  4  --wait-reply timed out
+
+Protocol:
+  After a successful send, treat the message as DELIVERED.
+  Do NOT poll the target with repeated agent/pane read.
+  If you need the result, use --wait-reply or wait on SELF for the match string.
+  The receiver must reply to reply-to with the same task id.
 EOF
 }
 
@@ -20,16 +48,17 @@ if [[ $# -lt 1 ]]; then
   exit 2
 fi
 
-if [[ "${HERDR_ENV:-}" != "1" ]]; then
-  echo "error: HERDR_ENV is not 1; refusing to control live Herdr panes" >&2
-  exit 2
-fi
-
 target=$1
 shift
 kind="request"
 task="general"
 status=""
+verify=0
+wait_reply=0
+timeout_ms=60000
+verify_timeout_ms=5000
+dry_run=0
+quiet=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +73,30 @@ while [[ $# -gt 0 ]]; do
     --status)
       status="${2:?missing value for --status}"
       shift 2
+      ;;
+    --verify)
+      verify=1
+      shift
+      ;;
+    --wait-reply)
+      wait_reply=1
+      shift
+      ;;
+    --timeout)
+      timeout_ms="${2:?missing value for --timeout}"
+      shift 2
+      ;;
+    --verify-timeout)
+      verify_timeout_ms="${2:?missing value for --verify-timeout}"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --quiet)
+      quiet=1
+      shift
       ;;
     --)
       shift
@@ -65,6 +118,20 @@ elif [[ ! -t 0 ]]; then
   body=$(cat)
 else
   echo "error: message body required on argv or stdin" >&2
+  exit 2
+fi
+
+if [[ ! "$timeout_ms" =~ ^[0-9]+$ ]]; then
+  echo "error: --timeout must be a non-negative integer (ms)" >&2
+  exit 2
+fi
+if [[ ! "$verify_timeout_ms" =~ ^[0-9]+$ ]]; then
+  echo "error: --verify-timeout must be a non-negative integer (ms)" >&2
+  exit 2
+fi
+
+if [[ "${HERDR_ENV:-}" != "1" ]]; then
+  echo "error: HERDR_ENV is not 1; refusing to control live Herdr panes" >&2
   exit 2
 fi
 
@@ -130,6 +197,31 @@ first_pane_object() {
   fi
 }
 
+print_receipt() {
+  if [[ "$quiet" -eq 1 ]]; then
+    return 0
+  fi
+  local state="$1"
+  local verified_flag="${2:-0}"
+  local ok_flag=1
+  if [[ "$state" == "verify-failed" || "$state" == "wait-timeout" || "$state" == "error" ]]; then
+    ok_flag=0
+  fi
+  cat <<EOF
+ok=${ok_flag}
+state=${state}
+task=${task_value}
+kind=${kind_value}
+target=${target}
+target_pane=${target_pane_id}
+from=${agent_value}
+reply_to=${pane_value}
+match=${reply_match}
+verified=${verified_flag}
+hint=${receipt_hint}
+EOF
+}
+
 info_json=$(herdr pane list)
 current_json=""
 if [[ -n "${HERDR_PANE_ID:-}" ]]; then
@@ -173,6 +265,9 @@ fi
 header="${header}]"
 
 payload="${header}"$'\n'"${body}"
+reply_match="kind:reply task:${task_value}"
+delivery_match="task:${task_value}"
+
 target_info=$(herdr agent get "$target" 2>/dev/null || true)
 target_info_without_sessions=$(strip_simple_agent_session "$target_info")
 target_pane_id=$(json_string_field "$target_info_without_sessions" pane_id)
@@ -185,4 +280,73 @@ if [[ -z "$target_pane_id" ]]; then
   fi
 fi
 
-herdr pane run "$target_pane_id" "$payload"
+if [[ -z "$resolved_pane_id" || "$resolved_pane_id" == "unknown" ]]; then
+  echo "error: could not resolve sender pane id (set HERDR_PANE_ID)" >&2
+  exit 1
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+  receipt_hint="DRY-RUN only. No message was sent. Do not poll the target."
+  if [[ "$quiet" -eq 0 ]]; then
+    printf 'payload<<EOF\n%s\nEOF\n' "$payload"
+  fi
+  print_receipt "dry-run" 0
+  exit 0
+fi
+
+if ! herdr pane run "$target_pane_id" "$payload"; then
+  echo "error: herdr pane run failed for target pane: $target_pane_id" >&2
+  receipt_hint="SEND failed. Fix the target and resend. Do not poll the target."
+  print_receipt "error" 0 || true
+  exit 1
+fi
+
+verified_flag=0
+if [[ "$verify" -eq 1 ]]; then
+  if herdr wait output "$target_pane_id" \
+    --match "$delivery_match" \
+    --source recent-unwrapped \
+    --timeout "$verify_timeout_ms" >/dev/null 2>&1; then
+    verified_flag=1
+  else
+    # One cheap read as a second chance before failing verify.
+    if herdr pane read "$target_pane_id" --source recent-unwrapped --lines 40 2>/dev/null \
+      | grep -F -q -- "$delivery_match"; then
+      verified_flag=1
+    else
+      receipt_hint="VERIFY failed. Message may not have landed. Do not start a poll loop; diagnose once then resend if needed."
+      print_receipt "verify-failed" 0
+      exit 3
+    fi
+  fi
+fi
+
+if [[ "$wait_reply" -eq 1 ]]; then
+  receipt_hint="DELIVERED. Waiting on self for ${reply_match}. Do not poll the target."
+  print_receipt "waiting-reply" "$verified_flag"
+
+  if herdr wait output "$resolved_pane_id" \
+    --match "$reply_match" \
+    --source recent-unwrapped \
+    --timeout "$timeout_ms"; then
+    echo "--- reply (self pane recent-unwrapped) ---"
+    herdr pane read "$resolved_pane_id" --source recent-unwrapped --lines 100 || true
+    receipt_hint="REPLY received on self. Integrate it. Do not poll the target."
+    print_receipt "replied" "$verified_flag"
+    exit 0
+  else
+    receipt_hint="WAIT timed out on self for ${reply_match}. Read SELF once for diagnosis. Do not poll the target in a loop."
+    print_receipt "wait-timeout" "$verified_flag"
+    exit 4
+  fi
+fi
+
+if [[ "$verified_flag" -eq 1 ]]; then
+  receipt_hint="DELIVERED and verified. Do not poll the target. Continue local work, or wait on self: herdr wait output ${resolved_pane_id} --match \"${reply_match}\" --timeout ${timeout_ms}"
+  print_receipt "delivered" 1
+else
+  receipt_hint="DELIVERED. Do not poll the target. Continue local work, or wait on self: herdr wait output ${resolved_pane_id} --match \"${reply_match}\" --timeout ${timeout_ms}"
+  print_receipt "delivered" 0
+fi
+
+exit 0

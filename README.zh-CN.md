@@ -11,9 +11,11 @@
 这个仓库的目标是把 Herdr skill 调整成更明确的协作指南：
 
 - 先用 `herdr agent list` 和 `herdr pane list` 做发现；
-- 行动前读取目标 pane 或 agent 的当前输出；
+- 行动前 **只读一次** 目标 pane 或 agent 的当前输出（不是轮询）；
 - 等待明确的输出标记，而不是笼统等待 `done`；
 - agent 间消息带上 `reply-to`、发送者、任务 id 等元信息；
+- `herdr-msg` 发送成功即视为 **DELIVERED**，之后停止观察对方；
+- 需要同步时在 **自己的 pane** 上等 `kind:reply task:<id>`（或使用 `--wait-reply`）；
 - 发出委托后继续处理本地可推进的工作，不轮询 sibling agent；
 - 把详细命令参考放到 `references/` 中，保持主 `SKILL.md` 精简。
 
@@ -85,4 +87,17 @@ Review src/api and reply with DONE or BLOCKED.
 
 接收方可以直接从消息头中知道应该回复到哪里，从而避免常见的低效循环：发送任务后等待目标 agent 进入 `done`，长时间阻塞，超时后才读取目标 pane。
 
-skill 中仍然保留 `agent wait` 和 `wait agent-status` 的说明，但把它们视为兜底工具。默认同步方式应该是明确输出标记或结构化回复。
+发送成功后 helper 会打印 key=value **回执**（`state=delivered`、`match=...`、`hint=...`），明确告知「已送达」以及下一步该做什么。可选参数：
+
+| 参数 | 作用 |
+|------|------|
+| `--verify` | 在目标 pane 上做 **一次性** 送达确认（不是任务完成） |
+| `--wait-reply` | 在发送方自己的 pane 上阻塞等待 `kind:reply task:<id>` |
+| `--timeout` / `--verify-timeout` | 上述等待的毫秒超时 |
+| `--dry-run` | 只打印 payload 和回执，不真正发送 |
+
+退出码：`0` 成功，`1` 发送/解析失败，`2` 用法/环境错误，`3` verify 失败，`4` wait-reply 超时。
+
+期望的发送后协议是：**送达 → 停止轮询对方 → 继续本地工作，或在自己 pane 上等回复**。skill 将发送后反复 `agent read` / `pane read` 对方视为协议违规。
+
+skill 中仍然保留 `agent wait` 和 `wait agent-status` 的说明，但把它们视为兜底工具。默认同步点应是明确输出标记，或发送方自己 pane 上的结构化回复。

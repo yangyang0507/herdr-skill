@@ -181,6 +181,62 @@ herdr pane report-agent <pane-id> --source <id> --agent <label> --state working 
 herdr pane report-metadata <pane-id> --source <id> --title "api review" --custom-status "waiting for tests"
 ```
 
+## `scripts/herdr-msg`
+
+Preferred agent-to-agent transport. Resolves the target agent/pane, builds a structured header, and submits with `herdr pane run`.
+
+```bash
+scripts/herdr-msg <target> [--kind request|reply|update] [--task id] [--status text] \
+  [--verify] [--wait-reply] [--timeout MS] [--verify-timeout MS] [--dry-run] [--quiet] \
+  [--] [message...]
+```
+
+Message body may be argv or stdin.
+
+| Flag | Meaning |
+|------|---------|
+| `--verify` | After send, confirm the task marker appears once on the **target** pane. Delivery only, not completion. |
+| `--wait-reply` | After send, block on **SELF** until `kind:reply task:<id>` appears. |
+| `--timeout MS` | Timeout for `--wait-reply` (default `60000`). |
+| `--verify-timeout MS` | Timeout for `--verify` (default `5000`). |
+| `--dry-run` | Resolve and print payload/receipt; do not send. |
+| `--quiet` | Suppress the key=value receipt. |
+
+Receipt fields (stdout): `ok`, `state`, `task`, `kind`, `target`, `target_pane`, `from`, `reply_to`, `match`, `verified`, `hint`.
+
+| `state` | Meaning |
+|---------|---------|
+| `delivered` | Send succeeded; stop observing the target. |
+| `waiting-reply` | Send succeeded; currently waiting on SELF. |
+| `replied` | Structured reply observed on SELF. |
+| `dry-run` | Nothing sent. |
+| `verify-failed` | Delivery not observed on target (exit `3`). |
+| `wait-timeout` | No reply on SELF in time (exit `4`). |
+| `error` | Send/resolve failure (exit `1`). |
+
+Exit codes: `0` ok, `1` send/resolve fail, `2` usage/env, `3` verify failed, `4` wait-reply timeout.
+
+**Do not** follow a successful send with a poll loop on the target (`agent read` / `pane read` repeatedly). Use `--wait-reply` or `herdr wait output` on `$HERDR_PANE_ID` with the printed `match` value.
+
+Examples:
+
+```bash
+# Deliver and stop
+scripts/herdr-msg reviewer --task api-review <<'MSG'
+Review src/api. Reply DONE or BLOCKED to reply-to.
+MSG
+
+# Deliver, verify once, stop
+scripts/herdr-msg reviewer --task api-review --verify <<'MSG'
+...
+MSG
+
+# Deliver and wait on self for the reply
+scripts/herdr-msg reviewer --task api-review --wait-reply --timeout 120000 <<'MSG'
+...
+MSG
+```
+
 ## Message Transport Without The Helper
 
 If `scripts/herdr-msg` is unavailable, create a message manually and pass it as one argument:
@@ -191,6 +247,8 @@ TARGET_PANE=$(herdr agent get reviewer | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p
 MSG="[herdr-msg from:codex pane:$SELF reply-to:$SELF at:current kind:request task:review]
 Please review src/api. Reply to reply-to with DONE or BLOCKED."
 herdr pane run "$TARGET_PANE" "$MSG"
+# DELIVERED. Do not poll TARGET_PANE. Wait on SELF if you need the reply:
+# herdr wait output "$SELF" --match "kind:reply task:review" --timeout 60000
 ```
 
 Avoid shell one-liners with complex quoting. Use a variable, heredoc, or `scripts/herdr-msg` for multi-line messages.
