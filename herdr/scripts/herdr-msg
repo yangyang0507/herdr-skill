@@ -1,62 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sentinel field limits keep machine lines short (avoid terminal wrap) and unambiguous.
-readonly TASK_MAX_LEN=32
-readonly MSG_ID_MAX_LEN=16
-# Sentinel token charset: no colons (field sep), no spaces (wrap/TUI).
-readonly FIELD_RE='^[A-Za-z0-9][A-Za-z0-9_-]*$'
+# Lightweight agent-to-agent messages for Herdr.
+# Default contract: deliver -> print small receipt -> stop / end turn.
+# No msg_id, sentinels, wait-reply, or verify. The peer push-replies into reply-to.
 
 usage() {
   cat <<'EOF'
-Usage: scripts/herdr-msg <target> [options] [--] [message...]
+Usage: scripts/herdr-msg <target> [--task id] [--kind request|reply|update] [--] [message...]
 
-Sends and submits a structured herdr-msg to another Herdr agent. Message text
-may be passed as arguments or on stdin.
+Sends a one-line herdr-msg header plus body to another Herdr agent/pane via
+`herdr pane run`, then exits. Message text may be argv or stdin.
 
-The [herdr-msg ...] header is human metadata only. Machine synchronization uses
-short standalone sentinel lines (unique msg id + bounded task):
+Default header (minimal):
+  [herdr-msg reply-to:<self-pane> task:<task>]
+  <body>
 
-  <<<herdr-msg:v1:send:TASK:MSGID>>>
-  <<<herdr-msg:v1:ack:TASK:MSGID>>>
+Optional: --kind request|reply|update (included in header when not "request")
+  HERDR_AGENT_NAME / detected agent name adds from:<name> when available.
+
+After a successful send: stop. Do not poll the target. Do not block-wait.
+When the peer injects a reply into your pane, handle that inbound message.
 
 Options:
-  --kind request|reply|update   Message kind (default: request)
-  --task id                     Task id (default: general; [A-Za-z0-9_-], max 32)
-  --status text                 Optional status field in the header
-  --msg-id id                   Message id (default auto; [A-Za-z0-9_-], max 16)
-  --ack-of MSGID                When --kind reply: emit ack for this send msg-id
-  --verify                      After send, try to observe outbound sentinel on target
-  --wait-reply                  After send, wait on SELF for ack sentinel
-  --timeout MS                  Timeout for --wait-reply (default: 60000)
-  --verify-timeout MS           Timeout for --verify (default: 5000)
-  --legacy-wait-header          With --wait-reply, REPLACE sentinel wait with header regex
-  --allow-self-target           Allow target pane == SELF (dangerous with --wait-reply)
-  --allow-empty                 Allow empty/whitespace-only message body
-  --dry-run                     Resolve targets and print payload; do not send
-  --quiet                       Suppress the key=value receipt on stdout
-  -h, --help                    Show this help
+  --task id          Human thread label (default: general)
+  --kind KIND        request|reply|update (default: request)
+  --allow-self       Allow sending a request to your own pane (default: refuse)
+  --dry-run          Print payload and receipt; do not send
+  --quiet            Suppress receipt on stdout
+  -h, --help         Show this help
 
-Receipt (stdout, unless --quiet) never prints the exact waitable token string
-(so SELF wait is not poisoned by the receipt). Reconstruct:
-
-  match = '<<<herdr-msg:' + reply_fields + '>>>'
-  e.g. reply_fields=v1:ack:TASK:MSGID
-
-Fields: ok state task kind msg_id ack_msg_id target target_pane from reply_to
-  outbound_fields send_fields reply_fields match_mode observed verified hint
+Receipt (stdout, unless --quiet):
+  ok state target target_pane reply_to task kind hint
 
 Exit codes:
-  0  success (delivered; --verify unobserved still exits 0)
-  1  send or resolve failure
-  2  usage or environment error
-  4  --wait-reply timed out
-
-Protocol:
-  pane run success => DELIVERED. Do NOT poll the target.
-  --verify is optional screen observation (not delivery).
-  --wait-reply waits on SELF for the reconstructed ack sentinel (fixed string).
-  Replies: --kind reply --ack-of MSGID prepends the correct ack first line.
+  0  delivered (or dry-run)
+  1  send / resolve failure
+  2  usage / environment / self-target refuse / empty body
 EOF
 }
 
@@ -80,76 +60,26 @@ fi
 
 target=$1
 shift
-kind="request"
 task="general"
-status=""
-msg_id_opt=""
-ack_of=""
-verify=0
-wait_reply=0
-timeout_ms=60000
-verify_timeout_ms=5000
+kind="request"
 dry_run=0
 quiet=0
-allow_empty=0
-legacy_wait_header=0
-allow_self_target=0
+allow_self=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --kind)
-      require_opt_value "$1" "${2:-}"
-      kind="$2"
-      shift 2
-      ;;
     --task)
       require_opt_value "$1" "${2:-}"
       task="$2"
       shift 2
       ;;
-    --status)
+    --kind)
       require_opt_value "$1" "${2:-}"
-      status="$2"
+      kind="$2"
       shift 2
       ;;
-    --msg-id)
-      require_opt_value "$1" "${2:-}"
-      msg_id_opt="$2"
-      shift 2
-      ;;
-    --ack-of)
-      require_opt_value "$1" "${2:-}"
-      ack_of="$2"
-      shift 2
-      ;;
-    --verify)
-      verify=1
-      shift
-      ;;
-    --wait-reply)
-      wait_reply=1
-      shift
-      ;;
-    --timeout)
-      require_opt_value "$1" "${2:-}"
-      timeout_ms="$2"
-      shift 2
-      ;;
-    --verify-timeout)
-      require_opt_value "$1" "${2:-}"
-      verify_timeout_ms="$2"
-      shift 2
-      ;;
-    --legacy-wait-header)
-      legacy_wait_header=1
-      shift
-      ;;
-    --allow-self-target)
-      allow_self_target=1
-      shift
-      ;;
-    --allow-empty)
-      allow_empty=1
+    --allow-self)
+      allow_self=1
       shift
       ;;
     --dry-run)
@@ -166,6 +96,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -*)
       echo "error: unknown option: $1" >&2
+      echo "error: lightweight mode supports --task --kind --allow-self --dry-run --quiet" >&2
       exit 2
       ;;
     *)
@@ -182,6 +113,23 @@ case "$kind" in
     ;;
 esac
 
+# Reject newlines/control chars in task (keep header one line).
+if [[ "$task" == *$'\n'* || "$task" == *$'\r'* || "$task" == *']'* ]]; then
+  echo "error: --task must be a single line without ] or newlines" >&2
+  exit 2
+fi
+if [[ -z "${task//[[:space:]]/}" ]]; then
+  echo "error: --task is empty" >&2
+  exit 2
+fi
+# Collapse internal whitespace for a stable header token.
+task_value=$(printf '%s' "$task" | tr -s '[:space:]' '-')
+task_value=${task_value//]/}
+task_value=${task_value//]/-}
+if [[ -z "$task_value" ]]; then
+  task_value="general"
+fi
+
 if [[ $# -gt 0 ]]; then
   body="$*"
 elif [[ ! -t 0 ]]; then
@@ -191,17 +139,8 @@ else
   exit 2
 fi
 
-if [[ "$allow_empty" -eq 0 && -z "${body//[[:space:]]/}" ]]; then
-  echo "error: message body is empty (use --allow-empty to override)" >&2
-  exit 2
-fi
-
-if [[ ! "$timeout_ms" =~ ^[0-9]+$ ]]; then
-  echo "error: --timeout must be a non-negative integer (ms)" >&2
-  exit 2
-fi
-if [[ ! "$verify_timeout_ms" =~ ^[0-9]+$ ]]; then
-  echo "error: --verify-timeout must be a non-negative integer (ms)" >&2
+if [[ -z "${body//[[:space:]]/}" ]]; then
+  echo "error: message body is empty" >&2
   exit 2
 fi
 
@@ -209,72 +148,6 @@ if [[ "${HERDR_ENV:-}" != "1" ]]; then
   echo "error: HERDR_ENV is not 1; refusing to control live Herdr panes" >&2
   exit 2
 fi
-
-clean_header_value() {
-  local text="${1:-unknown}"
-  text="${text//]/-}"
-  text="${text//[[:space:]]/-}"
-  while [[ "$text" == *--* ]]; do
-    text="${text//--/-}"
-  done
-  while [[ "$text" == -* ]]; do
-    text="${text#-}"
-  done
-  while [[ "$text" == *- ]]; do
-    text="${text%-}"
-  done
-  if [[ -z "$text" ]]; then
-    text="unknown"
-  fi
-  printf '%s' "$text"
-}
-
-# Reject (do not rewrite) user-supplied sentinel field values.
-require_sentinel_field() {
-  local label="$1"
-  local value="$2"
-  local max_len="$3"
-  if [[ ! "$value" =~ $FIELD_RE ]]; then
-    echo "error: invalid ${label} '${value}' (use [A-Za-z0-9_-], start with alnum, no colons/spaces)" >&2
-    exit 2
-  fi
-  if ((${#value} > max_len)); then
-    echo "error: ${label} longer than ${max_len} characters (got ${#value})" >&2
-    exit 2
-  fi
-}
-
-generate_msg_id() {
-  printf 'm%04x%04x%04x' "$$" "$RANDOM" "$RANDOM"
-}
-
-make_sentinel() {
-  # $1 = send|ack  $2 = task  $3 = msg_id
-  printf '<<<herdr-msg:v1:%s:%s:%s>>>' "$1" "$2" "$3"
-}
-
-make_fields() {
-  # printable non-waitable form: v1:send|ack:TASK:MSGID
-  printf 'v1:%s:%s:%s' "$1" "$2" "$3"
-}
-
-regex_escape() {
-  local s="$1"
-  local out="" i c
-  local -i n=${#s}
-  for ((i = 0; i < n; i++)); do
-    c=${s:i:1}
-    case "$c" in
-      '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}')
-        out+="\\${c}"
-        ;;
-      *)
-        out+="$c"
-        ;;
-    esac
-  done
-  printf '%s' "$out"
-}
 
 json_string_field() {
   local json="$1"
@@ -328,8 +201,7 @@ first_pane_object() {
   fi
 }
 
-# Resolve any accepted handle (pane_id, terminal_id, agent target) to canonical pane_id.
-# Uses agent get, pane get, then pane-list match on pane_id / terminal_id.
+# Resolve handle (agent name, pane_id, terminal_id) to canonical pane_id.
 resolve_canonical_pane_id() {
   local handle="$1"
   local list_json="${2:-}"
@@ -367,40 +239,23 @@ resolve_canonical_pane_id() {
   fi
 }
 
-first_body_line() {
-  printf '%s\n' "$1" | head -n 1
-}
-
-# Receipt must NEVER contain the exact waitable token (<<<herdr-msg:...>>>),
-# because Herdr wait output matches the recent SELF buffer and would self-hit.
 print_receipt() {
   if [[ "$quiet" -eq 1 ]]; then
     return 0
   fi
   local state="$1"
-  local observed_flag="${2:-0}"
   local ok_flag=1
-  if [[ "$state" == "wait-timeout" || "$state" == "error" ]]; then
+  if [[ "$state" == "error" ]]; then
     ok_flag=0
   fi
   cat <<EOF
 ok=${ok_flag}
 state=${state}
-task=${task_value}
-kind=${kind_value}
-msg_id=${msg_id}
-ack_msg_id=${ack_msg_id}
 target=${target}
 target_pane=${target_pane_id}
-from=${agent_value}
-reply_to=${pane_value}
-outbound_fields=${outbound_fields}
-send_fields=${send_fields}
-reply_fields=${reply_fields}
-match_mode=${wait_match_mode}
-match_recipe=${match_recipe}
-observed=${observed_flag}
-verified=${observed_flag}
+reply_to=${reply_to}
+task=${task_value}
+kind=${kind}
 hint=${receipt_hint}
 EOF
 }
@@ -408,20 +263,18 @@ EOF
 info_json=$(herdr pane list)
 info_without_sessions=$(strip_simple_agent_session "$info_json")
 
-# Canonical self pane id (e.g. w1:p1) for identity comparisons.
-# HERDR_PANE_ID may be pane_id or another handle such as terminal_id (term_...).
-canonical_self_pane_id=""
+# SELF: prefer HERDR_PANE_ID handle for APIs; canonicalize for comparisons / header.
+canonical_self=""
 if [[ -n "${HERDR_PANE_ID:-}" ]]; then
-  canonical_self_pane_id=$(resolve_canonical_pane_id "$HERDR_PANE_ID" "$info_without_sessions")
+  canonical_self=$(resolve_canonical_pane_id "$HERDR_PANE_ID" "$info_without_sessions")
 fi
 
 source_json=""
-if [[ -n "$canonical_self_pane_id" ]]; then
-  source_json=$(pane_object_with_pane_id "$info_without_sessions" "$canonical_self_pane_id")
+if [[ -n "$canonical_self" ]]; then
+  source_json=$(pane_object_with_pane_id "$info_without_sessions" "$canonical_self")
 fi
 if [[ -z "$(json_string_field "$source_json" pane_id)" && -n "${HERDR_PANE_ID:-}" ]]; then
-  current_json=$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null || true)
-  source_json=$(strip_simple_agent_session "$current_json")
+  source_json=$(strip_simple_agent_session "$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null || true)")
 fi
 if [[ -z "$(json_string_field "$source_json" pane_id)" ]]; then
   source_json=$(pane_object_with_focused "$info_without_sessions")
@@ -429,129 +282,37 @@ fi
 if [[ -z "$(json_string_field "$source_json" pane_id)" ]]; then
   source_json=$(first_pane_object "$info_without_sessions")
 fi
-if [[ -z "$canonical_self_pane_id" ]]; then
-  canonical_self_pane_id=$(json_string_field "$source_json" pane_id)
+if [[ -z "$canonical_self" ]]; then
+  canonical_self=$(json_string_field "$source_json" pane_id)
 fi
 
-resolved_agent=$(json_string_field "$source_json" agent)
-if [[ -z "$resolved_agent" ]]; then
-  resolved_agent=$(json_string_field "$source_json" label)
-fi
-if [[ -z "$resolved_agent" ]]; then
-  resolved_agent="agent"
-fi
-
-# Usable handle for wait/reply APIs: prefer env handle, else canonical pane_id.
-resolved_pane_id="${HERDR_PANE_ID:-$canonical_self_pane_id}"
-resolved_workspace_id="${HERDR_WORKSPACE_ID:-$(json_string_field "$source_json" workspace_id)}"
-resolved_tab_id="${HERDR_TAB_ID:-$(json_string_field "$source_json" tab_id)}"
-
-agent_value=$(clean_header_value "${HERDR_AGENT_NAME:-$resolved_agent}")
-# Prefer canonical pane id in human header when available (stable identity).
-pane_value=$(clean_header_value "${canonical_self_pane_id:-${resolved_pane_id:-unknown}}")
-workspace_value=$(clean_header_value "${resolved_workspace_id:-unknown-workspace}")
-tab_value=$(clean_header_value "${resolved_tab_id:-unknown-tab}")
-kind_value=$(clean_header_value "$kind")
-
-# Task used in sentinels: strict charset/length (not free-form header scrubbing).
-# Allow default "general"; for other values require FIELD_RE + max length.
-task_value="$task"
-# Normalize only trivial whitespace/bracket issues for task if it came messy:
-if [[ "$task_value" == *[[:space:]]* || "$task_value" == *']'* ]]; then
-  echo "error: --task must be [A-Za-z0-9_-] only (no spaces), max ${TASK_MAX_LEN} chars" >&2
-  exit 2
-fi
-require_sentinel_field "task" "$task_value" "$TASK_MAX_LEN"
-
-if [[ -n "$msg_id_opt" ]]; then
-  require_sentinel_field "msg-id" "$msg_id_opt" "$MSG_ID_MAX_LEN"
-  msg_id="$msg_id_opt"
-else
-  msg_id=$(generate_msg_id)
-  # Auto ids are always safe; belt-and-suspenders length check.
-  require_sentinel_field "msg-id" "$msg_id" "$MSG_ID_MAX_LEN"
+# reply-to: canonical pane id when known (stable for peers); else env handle.
+reply_to="${canonical_self:-${HERDR_PANE_ID:-}}"
+if [[ -z "$reply_to" ]]; then
+  echo "error: could not resolve self pane (set HERDR_PANE_ID)" >&2
+  exit 1
 fi
 
-ack_msg_id="$msg_id"
-if [[ -n "$ack_of" ]]; then
-  require_sentinel_field "ack-of" "$ack_of" "$MSG_ID_MAX_LEN"
-  if [[ "$kind" == "reply" ]]; then
-    ack_msg_id="$ack_of"
-  else
-    echo "warning: --ack-of ignored unless --kind reply" >&2
-  fi
+from_name="${HERDR_AGENT_NAME:-$(json_string_field "$source_json" agent)}"
+if [[ -z "$from_name" ]]; then
+  from_name=$(json_string_field "$source_json" label)
 fi
 
-# Full tokens (in-memory only for pane run / wait; not printed in receipts).
-send_sentinel=$(make_sentinel send "$task_value" "$msg_id")
-reply_sentinel=$(make_sentinel ack "$task_value" "$msg_id")
-if [[ "$kind" == "reply" ]]; then
-  outbound_sentinel=$(make_sentinel ack "$task_value" "$ack_msg_id")
-  # Expected wait token for a reply is not used; fields still describe outbound.
-  reply_sentinel="$outbound_sentinel"
-else
-  outbound_sentinel="$send_sentinel"
+# Build one-line header. Always: reply-to + task. Optional: from, kind.
+header="[herdr-msg"
+if [[ -n "$from_name" ]]; then
+  # scrub ] and whitespace for one-line safety
+  from_clean=${from_name//]/-}
+  from_clean=$(printf '%s' "$from_clean" | tr -s '[:space:]' '-')
+  header="${header} from:${from_clean}"
 fi
-
-send_fields=$(make_fields send "$task_value" "$msg_id")
-if [[ "$kind" == "reply" ]]; then
-  outbound_fields=$(make_fields ack "$task_value" "$ack_msg_id")
-  reply_fields="$outbound_fields"
-  send_fields="$outbound_fields"
-else
-  outbound_fields=$(make_fields send "$task_value" "$msg_id")
-  reply_fields=$(make_fields ack "$task_value" "$msg_id")
-fi
-
-wait_match_mode="fixed"
-wait_match_token="$reply_sentinel"
-match_recipe="wrap reply_fields as triple-angle herdr-msg token"
-if [[ "$legacy_wait_header" -eq 1 ]]; then
-  task_re=$(regex_escape "$task_value")
-  wait_match_token="^\\[herdr-msg [^]]* kind:reply task:${task_re}( |\\])"
-  wait_match_mode="regex"
-  match_recipe="legacy: regex match [herdr-msg ...] kind:reply task:TASK header (replaces sentinel wait)"
-fi
-
-# Human header: id first; not used for machine waits.
-header="[herdr-msg id:${msg_id} from:${agent_value} pane:${pane_value} reply-to:${pane_value} at:${workspace_value}/${tab_value} kind:${kind_value} task:${task_value}"
-if [[ -n "$status" ]]; then
-  header="${header} status:$(clean_header_value "$status")"
-fi
-if [[ "$kind" == "reply" && -n "$ack_of" ]]; then
-  header="${header} ack-of:${ack_of}"
+header="${header} reply-to:${reply_to} task:${task_value}"
+if [[ "$kind" != "request" ]]; then
+  header="${header} kind:${kind}"
 fi
 header="${header}]"
 
-# First body line must be exactly the outbound sentinel (or we prepend / error).
-user_body="$body"
-first_line=$(first_body_line "$user_body")
-if [[ "$first_line" == "$outbound_sentinel" ]]; then
-  composed_body="$user_body"
-elif [[ "$first_line" == "<<<herdr-msg:v1:"* ]]; then
-  echo "error: body first line is a herdr-msg sentinel but not the expected token" >&2
-  echo "error: expected first line: ${outbound_sentinel}" >&2
-  echo "error: got first line:      ${first_line}" >&2
-  exit 2
-else
-  composed_body="${outbound_sentinel}"$'\n'"${user_body}"
-fi
-
-# Requests: tell receiver how to ack without relying on fragile headers.
-# Instruction uses --ack-of MSGID (no raw ack token required in the instruction if
-# they use the helper). Still include the exact token for manual replies — that
-# lands on the TARGET pane only (not SELF receipt), which is correct.
-if [[ "$kind" == "request" ]]; then
-  reply_instructions="When done, reply to reply-to with the SAME task id.
-Prefer helper (auto-prepends correct ack):
-  scripts/herdr-msg <reply-to> --kind reply --task ${task_value} --ack-of ${msg_id} --status done
-Manual first body line must be EXACTLY:
-${reply_sentinel}
-Do not poll the sender; send one structured reply."
-  composed_body="${composed_body}"$'\n\n'"${reply_instructions}"
-fi
-
-payload="${header}"$'\n'"${composed_body}"
+payload="${header}"$'\n'"${body}"
 
 target_pane_id=$(resolve_canonical_pane_id "$target" "$info_without_sessions")
 if [[ -z "$target_pane_id" ]]; then
@@ -559,132 +320,28 @@ if [[ -z "$target_pane_id" ]]; then
   exit 1
 fi
 
-if [[ -z "$resolved_pane_id" || "$resolved_pane_id" == "unknown" ]]; then
-  echo "error: could not resolve sender pane id (set HERDR_PANE_ID)" >&2
-  exit 1
-fi
-if [[ -z "$canonical_self_pane_id" ]]; then
-  # Last resort: treat usable handle as canonical if resolution failed.
-  canonical_self_pane_id="$resolved_pane_id"
+if [[ "$target_pane_id" == "$canonical_self" && "$kind" == "request" && "$allow_self" -eq 0 ]]; then
+  echo "error: refusing request to self (${target_pane_id}); use another agent or --allow-self" >&2
+  exit 2
 fi
 
-# Same-pane target: request payloads embed the ack token, so --wait-reply on SELF
-# can immediately match the outbound text as if a reply arrived.
-# Compare CANONICAL pane ids only (HERDR_PANE_ID may be term_... / alias).
-if [[ "$target_pane_id" == "$canonical_self_pane_id" ]]; then
-  if [[ "$wait_reply" -eq 1 && "$allow_self_target" -eq 0 ]]; then
-    echo "error: --wait-reply with target pane == SELF (${target_pane_id}) can false-match the outbound ack instruction" >&2
-    echo "error: send to another agent/pane, or pass --allow-self-target if you really mean it" >&2
-    exit 2
-  fi
-  if [[ "$kind" == "request" && "$allow_self_target" -eq 0 ]]; then
-    echo "error: kind=request to SELF (${target_pane_id}; self handle=${resolved_pane_id}) is refused by default (ack text lands on the same pane you may wait on)" >&2
-    echo "error: use another target, or pass --allow-self-target" >&2
-    exit 2
-  fi
-  if [[ "$allow_self_target" -eq 1 ]]; then
-    echo "warning: target pane == SELF (${target_pane_id}); self-target allowed explicitly" >&2
-  fi
-fi
+receipt_hint="End turn. Do not poll the target. Do not block-wait. Handle the inbound reply when it is injected into your pane."
 
 if [[ "$dry_run" -eq 1 ]]; then
-  receipt_hint="DRY-RUN only. Payload below may contain live tokens; do not wait on SELF for them after dry-run. Do not poll the target."
   if [[ "$quiet" -eq 0 ]]; then
     printf 'payload<<EOF\n%s\nEOF\n' "$payload"
   fi
-  print_receipt "dry-run" 0
+  receipt_hint="DRY-RUN only. Nothing was sent. ${receipt_hint}"
+  print_receipt "dry-run"
   exit 0
 fi
 
 if ! herdr pane run "$target_pane_id" "$payload"; then
   echo "error: herdr pane run failed for target pane: $target_pane_id" >&2
-  receipt_hint="SEND failed. Fix the target and resend. Do not poll the target."
-  print_receipt "error" 0 || true
+  receipt_hint="SEND failed. Fix the target and resend. Do not poll."
+  print_receipt "error" || true
   exit 1
 fi
 
-# Delivered means pane run accepted/submitted input.
-observed_flag=0
-if [[ "$verify" -eq 1 ]]; then
-  if herdr wait output "$target_pane_id" \
-    --match "$outbound_sentinel" \
-    --source recent-unwrapped \
-    --timeout "$verify_timeout_ms" >/dev/null 2>&1; then
-    observed_flag=1
-  else
-    if herdr pane read "$target_pane_id" --source recent-unwrapped --lines 80 2>/dev/null \
-      | grep -F -q -- "$outbound_sentinel"; then
-      observed_flag=1
-    else
-      observed_flag=0
-    fi
-  fi
-fi
-
-# Hint never embeds the raw waitable token (would poison SELF recent buffer).
-# reply_fields is listed as a separate receipt key; reconstruct off-stream if needed.
-safe_wait_hint="Prefer --wait-reply. Manual wait: reconstruct the ack token from receipt reply_fields (v1:ack:TASK:MSGID) by wrapping with the herdr-msg triple-angle form in a NEW shell that does not echo the token into this pane first."
-if [[ "$wait_reply" -eq 1 ]]; then
-  if [[ "$kind" != "request" ]]; then
-    echo "warning: --wait-reply is intended for kind=request (got kind=${kind})" >&2
-  fi
-  if [[ "$task_value" == "general" ]]; then
-    echo "warning: --wait-reply with task=general is harder to debug; prefer a unique --task (msg_id still unique)" >&2
-  fi
-
-  if [[ "$observed_flag" -eq 1 ]]; then
-    receipt_hint="DELIVERED and observed. Waiting on self for ack (token not printed here). Do not poll the target."
-  elif [[ "$verify" -eq 1 ]]; then
-    receipt_hint="DELIVERED but unobserved on target. Waiting on self for ack. Do not poll the target."
-  else
-    receipt_hint="DELIVERED. Waiting on self for ack (token not printed here). Do not poll the target."
-  fi
-  # Receipt without raw token, then wait using in-memory token only.
-  print_receipt "waiting-reply" "$observed_flag"
-
-  wait_ok=0
-  if [[ "$legacy_wait_header" -eq 1 ]]; then
-    if herdr wait output "$resolved_pane_id" \
-      --match "$wait_match_token" \
-      --regex \
-      --source recent-unwrapped \
-      --timeout "$timeout_ms"; then
-      wait_ok=1
-    fi
-  else
-    if herdr wait output "$resolved_pane_id" \
-      --match "$wait_match_token" \
-      --source recent-unwrapped \
-      --timeout "$timeout_ms"; then
-      wait_ok=1
-    fi
-  fi
-
-  if [[ "$wait_ok" -eq 1 ]]; then
-    echo "--- reply (self pane recent-unwrapped) ---"
-    herdr pane read "$resolved_pane_id" --source recent-unwrapped --lines 100 || true
-    receipt_hint="REPLY ack observed on self. Integrate it. Do not poll the target."
-    print_receipt "replied" "$observed_flag"
-    exit 0
-  else
-    receipt_hint="WAIT timed out on self for ack. Read SELF once for diagnosis. Do not poll the target in a loop. ${safe_wait_hint}"
-    print_receipt "wait-timeout" "$observed_flag"
-    exit 4
-  fi
-fi
-
-if [[ "$verify" -eq 1 && "$observed_flag" -eq 0 ]]; then
-  receipt_hint="DELIVERED but outbound sentinel not observed on target (wrap/timing possible). Do not poll; treat as delivered-unobserved. ${safe_wait_hint}"
-  print_receipt "delivered-unobserved" 0
-  exit 0
-fi
-
-if [[ "$observed_flag" -eq 1 ]]; then
-  receipt_hint="DELIVERED and observed. Do not poll the target. Continue local work, or use --wait-reply next time. ${safe_wait_hint}"
-  print_receipt "delivered" 1
-else
-  receipt_hint="DELIVERED. Do not poll the target. Continue local work, or use --wait-reply. ${safe_wait_hint}"
-  print_receipt "delivered" 0
-fi
-
+print_receipt "delivered"
 exit 0
