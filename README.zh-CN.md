@@ -15,7 +15,7 @@
 - 等待明确的输出标记，而不是笼统等待 `done`；
 - agent 间消息带上 `reply-to`、发送者、任务 id 等元信息；
 - `herdr-msg` 发送成功即视为 **DELIVERED**，之后停止观察对方；
-- 需要同步时在 **自己的 pane** 上等 `kind:reply task:<id>`（或使用 `--wait-reply`）；
+- 需要同步时优先 `--wait-reply`；或从回执 `reply_fields` 重建 ack token（**不要**先把 raw token 打进 SELF 再 wait）；
 - 发出委托后继续处理本地可推进的工作，不轮询 sibling agent；
 - 把详细命令参考放到 `references/` 中，保持主 `SKILL.md` 精简。
 
@@ -78,26 +78,34 @@ uv run --with pyyaml python /path/to/quick_validate.py herdr
 
 ## 设计说明
 
-`herdr/scripts/herdr-msg` 会发送并提交类似这样的消息：
+`herdr/scripts/herdr-msg` 发送带人类可读 header 与机器 **sentinel** 的消息：
 
 ```text
-[herdr-msg from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]
+[herdr-msg id:m1a2b3c4 from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]
+<<<herdr-msg:v1:send:review:m1a2b3c4>>>
 Review src/api and reply with DONE or BLOCKED.
+
+When done, reply ... first body line:
+<<<herdr-msg:v1:ack:review:m1a2b3c4>>>
 ```
 
-接收方可以直接从消息头中知道应该回复到哪里，从而避免常见的低效循环：发送任务后等待目标 agent 进入 `done`，长时间阻塞，超时后才读取目标 pane。
+`[herdr-msg ...]` header 只作元数据（终端会折行、TUI 会插入装饰）。**同步匹配的是短 sentinel 行 + 唯一 MSGID**，不是 header，也不是 `agent-status done`。
 
-发送成功后 helper 会打印 key=value **回执**（`state=delivered`、`match=...`、`hint=...`），明确告知「已送达」以及下一步该做什么。可选参数：
+`pane run` 成功后 helper 打印 key=value **回执**（`state=delivered`、`msg_id`、`reply_fields`、`hint` 等）。回执**故意不打印**完整 waitable token（`<<<...>>>`），以免 `herdr wait output` 在 SELF 上命中自己的输出；用 `reply_fields=v1:ack:TASK:MSGID` 重建。可选参数：
 
 | 参数 | 作用 |
 |------|------|
-| `--verify` | 在目标 pane 上做 **一次性** 送达确认（不是任务完成） |
-| `--wait-reply` | 在发送方自己的 pane 上阻塞等待 `kind:reply task:<id>` |
-| `--timeout` / `--verify-timeout` | 上述等待的毫秒超时 |
+| `--verify` | 可选：在目标 pane 上观察 **outbound sentinel**。未观察到 → `delivered-unobserved`，仍 exit `0` |
+| `--wait-reply` | 在自己的 pane 上阻塞等待 ack sentinel（token 只在内存，回执不打印 raw token） |
+| `--msg-id` / `--ack-of` | 设置或关联 message id（非法 id 直接拒绝；task/msg-id 有长度上限） |
+| `--timeout` / `--verify-timeout` | 毫秒超时 |
+| `--legacy-wait-header` | 已废弃：**替换** sentinel 等待为 header 正则（不是叠加） |
+| `--allow-self-target` | 允许目标 pane == SELF（`request` / `--wait-reply` 默认拒绝） |
+| `--allow-empty` | 允许空 body（默认拒绝） |
 | `--dry-run` | 只打印 payload 和回执，不真正发送 |
 
-退出码：`0` 成功，`1` 发送/解析失败，`2` 用法/环境错误，`3` verify 失败，`4` wait-reply 超时。
+退出码：`0` 成功（含 delivered-unobserved），`1` 发送/解析失败，`2` 用法/环境错误，`4` wait-reply 超时。
 
-期望的发送后协议是：**送达 → 停止轮询对方 → 继续本地工作，或在自己 pane 上等回复**。skill 将发送后反复 `agent read` / `pane read` 对方视为协议违规。
+发送后协议：**送达 → 停止轮询对方 → 继续本地工作，或 `--wait-reply`**。发送后反复 `agent read` / `pane read` 对方视为协议违规。
 
-skill 中仍然保留 `agent wait` 和 `wait agent-status` 的说明，但把它们视为兜底工具。默认同步点应是明确输出标记，或发送方自己 pane 上的结构化回复。
+skill 仍把 `agent wait` / `wait agent-status` 当作兜底。默认同步点是发送方自己 pane 上的 ack sentinel。

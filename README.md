@@ -17,7 +17,7 @@ This repo refines that behavior around a few defaults:
 - wait for named output markers, not vague completion state;
 - use structured agent messages with `reply-to` metadata;
 - treat a successful `herdr-msg` send as **DELIVERED**, then stop observing the target;
-- if synchronization is needed, wait on **SELF** for `kind:reply task:<id>` (or use `--wait-reply`);
+- if synchronization is needed, use `--wait-reply` (or reconstruct the ack token from receipt `reply_fields` without printing the raw token into SELF first);
 - continue local work instead of polling sibling agents;
 - keep detailed command reference behind progressive disclosure.
 
@@ -80,26 +80,34 @@ Runtime behavior that touches live panes should only be tested from inside Herdr
 
 ## Design Notes
 
-`herdr/scripts/herdr-msg` sends and submits messages like:
+`herdr/scripts/herdr-msg` sends messages with a human header plus machine **sentinels**:
 
 ```text
-[herdr-msg from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]
+[herdr-msg id:m1a2b3c4 from:codex pane:p_42 reply-to:p_42 at:w1/w1:1 kind:request task:review]
+<<<herdr-msg:v1:send:review:m1a2b3c4>>>
 Review src/api and reply with DONE or BLOCKED.
+
+When done, reply ... first body line:
+<<<herdr-msg:v1:ack:review:m1a2b3c4>>>
 ```
 
-The receiver has enough metadata to reply directly to the sender. That avoids a common bad loop: sender sends work, waits for `done`, times out or blocks, then reads the target pane late.
+The `[herdr-msg ...]` header is metadata only (terminals wrap it; TUIs decorate it). **Synchronization matches short sentinel lines** with a unique `MSGID`, not headers and not `agent-status done`.
 
-After a successful send the helper prints a key=value **receipt** (`state=delivered`, `match=...`, `hint=...`) so the caller knows the message landed and what to do next. Optional flags:
+After a successful `pane run` the helper prints a key=value **receipt** (`state=delivered`, `msg_id`, `reply_fields`, `hint`, ...). Receipts intentionally **omit** the exact waitable `<<<...>>>` token so `herdr wait output` on SELF cannot false-match the helper's own output. Reconstruct with `reply_fields=v1:ack:TASK:MSGID`. Optional flags:
 
 | Flag | Role |
 |------|------|
-| `--verify` | One-shot delivery check on the target pane (not task completion). |
-| `--wait-reply` | Block on the sender pane until `kind:reply task:<id>` appears. |
-| `--timeout` / `--verify-timeout` | Millisecond timeouts for the above. |
+| `--verify` | Optional screen observation of the **outbound sentinel** on the target. Unobserved → `delivered-unobserved`, still exit `0`. |
+| `--wait-reply` | Block on SELF for the ack sentinel (token in memory only until a real reply arrives). |
+| `--msg-id` / `--ack-of` | Set or correlate message ids (invalid ids rejected; task/msg-id length-capped). |
+| `--timeout` / `--verify-timeout` | Millisecond timeouts. |
+| `--legacy-wait-header` | Deprecated: **replaces** sentinel wait with header regex. |
+| `--allow-self-target` | Allow target pane == SELF (refused by default for `request` / `--wait-reply`). |
+| `--allow-empty` | Allow empty body (rejected by default). |
 | `--dry-run` | Print payload and receipt without sending. |
 
-Exit codes: `0` ok, `1` send/resolve fail, `2` usage/env, `3` verify failed, `4` wait-reply timeout.
+Exit codes: `0` ok (including delivered-unobserved), `1` send/resolve fail, `2` usage/env, `4` wait-reply timeout.
 
-The intended post-send protocol is: **deliver → stop polling the target → continue local work or wait on self**. Repeated `agent read` / `pane read` of the worker after send is treated as a protocol violation in the skill.
+Post-send protocol: **deliver → stop polling the target → continue local work or `--wait-reply`**. Repeated `agent read` / `pane read` of the worker after send is a protocol violation.
 
-The skill still documents `agent wait` and `wait agent-status`, but treats them as fallback tools. The preferred synchronization point is either a concrete output marker or a structured reply on the sender's own pane.
+The skill still documents `agent wait` and `wait agent-status` as fallbacks. Preferred sync is the ack sentinel on the sender's own pane.

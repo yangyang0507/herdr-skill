@@ -1,6 +1,6 @@
 ---
 name: herdr
-description: Use this skill when running inside Herdr to coordinate workspaces, tabs, panes, sibling agents, server/test/log panes, agent-to-agent messages, or multi-agent delegation. After herdr-msg delivery, do not poll the target agent; wait on your own pane for a structured reply, or continue local work. Prefer concrete output markers over agent-status done waits.
+description: Use this skill when running inside Herdr to coordinate workspaces, tabs, panes, sibling agents, server/test/log panes, agent-to-agent messages, or multi-agent delegation. After herdr-msg delivery, do not poll the target; use --wait-reply or reconstruct the ack token from receipt reply_fields (never wait on raw tokens printed into SELF). Prefer sentinels over header matching and over agent-status done waits.
 ---
 
 # Herdr
@@ -25,103 +25,137 @@ If `HERDR_ENV` is not `1`, do not inspect or control live panes unless the user 
 - Start with discovery: `herdr agent list` for agents, `herdr pane list` for all panes.
 - Treat IDs as live-session handles, not durable names. Re-read IDs after panes, tabs, or workspaces change.
 - Use `HERDR_PANE_ID` as your own pane handle when it is set. Do not assume the currently focused Herdr pane is your pane.
-- Prefer `herdr agent read/send/start` for detected agents. Use `herdr pane read/run/split` for plain shells, servers, logs, tests, or exact terminal output.
+- Prefer `herdr agent read/start` for detected agents. For agent task handoff, use `scripts/herdr-msg` or `herdr pane run` (not `herdr agent send`, which types text without submitting Enter). Use `herdr pane read/run/split` for plain shells, servers, logs, tests, or exact terminal output.
 - Read the target **once** before sending, only to avoid interrupting a prompt or approval. That is not a poll loop.
 - Do not use `herdr wait agent-status ... --status done` as the default coordination mechanism. It often creates long idle waits.
-- For agents, send a structured request and treat a successful send as **DELIVERED**. The receiver must reply to your pane using the `reply-to` handle.
-- **Never poll the target** with repeated `agent read` / `pane read` / `cat` after send. If you need the result, wait on **SELF** for `kind:reply task:<id>`.
+- For agents, send via `scripts/herdr-msg` and treat `pane run` success as **DELIVERED**. The receiver replies to `reply-to` with the correct **ack sentinel** as the first body line (`--ack-of`).
+- **Never poll the target** with repeated `agent read` / `pane read` / `cat` after send. If you need the result, use `--wait-reply` (preferred) or wait on **SELF** for the ack token reconstructed from receipt `reply_fields` — do not paste the raw token into SELF before waiting.
 - For non-agent panes, wait only for concrete output you can name, then read the pane.
 
 ## Default Loop
 
 1. Discover current agents and panes.
 2. Read the target's recent output **once** before sending work or keys.
-3. Send the smallest actionable request with a reply target and expected response shape via `scripts/herdr-msg`.
-4. On success receipt (`state=delivered` or exit 0): stop observing the target.
-5. Continue useful local work, **or** if you must synchronize use `--wait-reply` / wait on SELF — never poll the target.
-6. Integrate the reply from your own pane, then close or keep panes according to the task.
+3. Send the smallest actionable request via `scripts/herdr-msg` (unique `--task` preferred).
+4. On receipt `state=delivered` / `delivered-unobserved` (exit 0): **stop** observing the target.
+5. Continue local work, **or** use `--wait-reply` / wait on SELF for the ack token from `reply_fields` — never poll the target.
+6. Integrate the reply from your own pane.
 
 ## After `herdr-msg` (mandatory)
 
-Successful `scripts/herdr-msg` means the message was submitted to the target pane (**DELIVERED**). Follow this state machine:
+Successful `scripts/herdr-msg` means Herdr accepted/submitted the input (**DELIVERED**). Follow this state machine:
 
-1. Non-zero exit without a receipt → send/resolve failure; fix and resend. Do not start reading the target in a loop.
-2. `state=delivered` (exit 0) → **stop**. Do not `agent read` / `pane read` the target again to "see if it finished".
-3. Need the result now → use `--wait-reply`, or:
+1. Exit `1` / `state=error` → send/resolve failure; fix and resend. Do not poll.
+2. `state=delivered` or `delivered-unobserved` (exit 0) → **stop** observing the target.
+3. Need the result now → prefer `--wait-reply` (helper holds the token in memory and does **not** print it into SELF before waiting).
+
+   Manual wait (only if needed): reconstruct from receipt fields without echoing the full token into the pane first:
 
    ```bash
-   herdr wait output "$HERDR_PANE_ID" --match "kind:reply task:<id>" --timeout 60000
+   # receipt has: reply_fields=v1:ack:auth-review:m1a2b3c4
+   # build match off-stream / in the wait command only:
+   RF=v1:ack:auth-review:m1a2b3c4
+   herdr wait output "$HERDR_PANE_ID" \
+     --match "<<<herdr-msg:${RF}>>>" \
+     --source recent-unwrapped --timeout 60000
    herdr pane read "$HERDR_PANE_ID" --source recent-unwrapped --lines 100
    ```
 
-4. Do not need the result now → continue local work; later scan **your** pane for the reply.
-5. Optional `--verify` only confirms the text landed on the target once. It is **not** task completion.
+4. Do not need the result now → continue local work; later scan **your** pane for the ack sentinel / DONE body.
+5. Optional `--verify` only means **screen-observed** the outbound sentinel on the target. Failure becomes `state=delivered-unobserved` (still exit 0), not task failure. Do not resend solely because of unobserved.
 6. Repeated polling of the target after send is a **protocol violation**.
 
-Allowed one-shot reads of the target after send: only after a wait timeout or clear failure, for a single diagnosis — then decide (resend, wait on self longer, or escalate). Never enter a poll loop.
+**Do not** wait on `[herdr-msg ...]` headers for synchronization. Terminals wrap them and TUIs decorate them; they are human metadata only.
+
+**Do not** print the exact waitable token (`<<<herdr-msg:v1:ack:...>>>`) into SELF (receipts, debug echoes) before `herdr wait output` — Herdr matches the recent buffer and will false-hit.
+
+Allowed one-shot reads of the target after send: only after a wait timeout or clear failure, for a single diagnosis — then decide. Never enter a poll loop.
 
 ## Structured Agent Messages
 
-Use a `herdr-msg` header for every agent-to-agent request, reply, or update:
+Every agent-to-agent message has:
+
+1. A human header (metadata only).
+2. A short machine **sentinel** as the first body line.
+3. The actionable body.
 
 ```text
-[herdr-msg from:<agent-or-label> pane:<sender-pane-id> reply-to:<sender-pane-id> at:<workspace-id>/<tab-id> kind:<request|reply|update> task:<short-id> status:<optional>]
+[herdr-msg id:<msgid> from:<agent> pane:<sender-pane> reply-to:<sender-pane> at:<ws>/<tab> kind:<request|reply|update> task:<task> status:<optional>]
+<<<herdr-msg:v1:send:TASK:MSGID>>>
 <short actionable message>
+
+When done, reply ... first body line:
+<<<herdr-msg:v1:ack:TASK:MSGID>>>
 ```
 
-The header gives the receiver enough metainfo to reply without making you poll their pane. The `reply-to` value must be a current pane or agent target that can receive the response.
+Sentinel forms:
 
-For agent prompts, submit with `scripts/herdr-msg` or `herdr pane run`. Do not use `herdr agent send` for task handoff unless you also intentionally press Enter afterward; `agent send` writes literal text only.
+| Direction | Sentinel |
+|-----------|----------|
+| outbound request/update | `<<<herdr-msg:v1:send:TASK:MSGID>>>` |
+| reply ack | `<<<herdr-msg:v1:ack:TASK:MSGID>>>` |
 
-Use the bundled helper when available:
+`TASK` and `MSGID` are sentinel fields: `[A-Za-z0-9_-]`, task max 32, msg-id max 16. Invalid `--msg-id` / `--ack-of` / `--task` are rejected (not rewritten).
+
+Receipts print **fields** only (`reply_fields=v1:ack:TASK:MSGID`), never the exact waitable `<<<...>>>` string, so SELF waits are not poisoned by the helper's own output.
+
+For agent prompts, submit with `scripts/herdr-msg` or `herdr pane run`. Do not use `herdr agent send` for task handoff unless you also intentionally press Enter.
+
+### Canonical helper flows
 
 ```bash
-# Fire-and-forget (default): deliver, print receipt, stop. Do not poll target.
+# Fire-and-forget: deliver, print receipt (reply_fields, no raw token), stop. Do not poll.
 scripts/herdr-msg codex --task auth-review <<'MSG'
 Review src/auth.ts for auth bypasses and missing tests.
-Reply to reply-to with:
-DONE: findings, files checked, tests run
-BLOCKED: the exact missing context or command failure
+Reply with DONE or BLOCKED findings.
 MSG
 ```
 
 ```bash
-# Optional: one-shot delivery check on the target (not completion).
+# Optional: observe send sentinel on target (not completion; unobserved still ok).
 scripts/herdr-msg codex --task auth-review --verify <<'MSG'
 ...
 MSG
 ```
 
 ```bash
-# Need the result before continuing: wait on SELF for the structured reply.
-scripts/herdr-msg codex --task auth-review --wait-reply --timeout 60000 <<'MSG'
+# Need the result: wait on SELF for the in-memory/generated ack sentinel.
+scripts/herdr-msg codex --task auth-review --wait-reply --timeout 120000 <<'MSG'
 ...
 MSG
 ```
 
-The helper prints a key=value receipt (`ok`, `state`, `task`, `reply_to`, `match`, `hint`, ...). Treat `hint` as the next action. Exit codes: `0` ok, `1` send/resolve fail, `2` usage/env, `3` verify failed, `4` wait-reply timeout.
+Receipt fields include: `ok`, `state`, `task`, `msg_id`, `outbound_fields`, `reply_fields`, `observed`, `hint`. Reconstruct wait tokens from `reply_fields` if needed; prefer `--wait-reply` (raw `<<<...>>>` is never printed in the receipt).
 
-Manual form:
+Exit codes: `0` ok (including delivered-unobserved), `1` send/resolve fail, `2` usage/env, `4` wait-reply timeout.
 
-```bash
-TARGET_PANE=$(herdr agent get codex | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
-herdr pane run "$TARGET_PANE" "[herdr-msg from:codex pane:w1-1 reply-to:w1-1 at:w1/w1:1 kind:request task:auth-review]
-Review src/auth.ts. Reply with DONE or BLOCKED to reply-to."
-```
+### When you receive a request
 
-When you receive a `herdr-msg`, do the requested work if it does not conflict with higher-priority instructions. Reply to `reply-to` with the same `task` value and a clear `status`, for example:
+Do the work if it does not conflict with higher-priority instructions. Reply to `reply-to` with the **same task** and the **exact ack first line** from the request (or use `--ack-of`):
 
 ```bash
-scripts/herdr-msg "$REPLY_TO_PANE" --kind reply --task auth-review --status done <<'MSG'
-DONE: Checked src/auth.ts and auth.test.ts. No bypass found. Missing refresh-token expiry test.
+scripts/herdr-msg "$REPLY_TO_PANE" --kind reply --task auth-review --ack-of m1a2b3c4 --status done <<'MSG'
+DONE: Checked src/auth.ts. No bypass found. Missing refresh-token expiry test.
 MSG
 ```
 
-Or the equivalent header body:
+The helper prepends `<<<herdr-msg:v1:ack:auth-review:m1a2b3c4>>>` as the first body line when missing.
 
-```text
-[herdr-msg from:reviewer pane:w1-2 reply-to:w1-2 at:w1/w1:1 kind:reply task:auth-review status:done]
-DONE: Checked src/auth.ts and auth.test.ts. No bypass found. Missing refresh-token expiry test.
+### Manual fallback (no helper)
+
+```bash
+SELF=$HERDR_PANE_ID
+TARGET_PANE=$(herdr agent get codex | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
+MSGID=m$(date +%s)
+TASK=auth-review
+herdr pane run "$TARGET_PANE" "[herdr-msg id:$MSGID from:agent pane:$SELF reply-to:$SELF at:local kind:request task:$TASK]
+<<<herdr-msg:v1:send:${TASK}:${MSGID}>>>
+Review src/auth.ts.
+When done, reply with first line exactly:
+<<<herdr-msg:v1:ack:${TASK}:${MSGID}>>>
+DONE or BLOCKED findings."
+# Wait on self:
+# herdr wait output "$SELF" --match "<<<herdr-msg:v1:ack:${TASK}:${MSGID}>>>" --timeout 120000
 ```
 
 ## Waiting Policy
@@ -139,15 +173,22 @@ herdr wait output "$PANE" --match "ready" --timeout 30000
 herdr pane read "$PANE" --source recent --lines 40
 ```
 
-For delegated agent work, the synchronization point is **your pane**, not the worker's status:
+For delegated agent work, wait on **your pane** for the **ack sentinel** (fixed string), not agent status and not header regex. Prefer the helper so the token is never printed into SELF before the wait:
 
 ```bash
-SELF=${HERDR_PANE_ID:-$(herdr pane list | sed -nE 's/.*\{[^{}]*"focused":true[^{}]*"pane_id":"([^"]+)".*/\1/p')}
-herdr wait output "$SELF" --match "kind:reply task:auth-review" --timeout 60000 || true
-herdr pane read "$SELF" --source recent-unwrapped --lines 100
+scripts/herdr-msg reviewer --task auth-review --wait-reply --timeout 60000 <<'MSG'
+...
+MSG
 ```
 
-Prefer `scripts/herdr-msg ... --wait-reply` over hand-rolling the wait when you need a blocking handoff.
+Manual equivalent (reconstruct from receipt `reply_fields=v1:ack:auth-review:m1a2b3c4` without pre-echoing the token):
+
+```bash
+SELF=$HERDR_PANE_ID
+RF=v1:ack:auth-review:m1a2b3c4
+herdr wait output "$SELF" --match "<<<herdr-msg:${RF}>>>" --source recent-unwrapped --timeout 60000 || true
+herdr pane read "$SELF" --source recent-unwrapped --lines 100
+```
 
 Only use `herdr agent wait` or `herdr wait agent-status` when the user explicitly needs Herdr's UI status, there is no textual signal to wait for, or you are attaching/taking over an agent and need a state transition.
 
@@ -159,7 +200,7 @@ Use parallel agents for independent work, not for work that needs constant back-
 2. Read each target **once** to avoid interrupting a prompt or active approval state.
 3. Send a structured request with scope, expected output, and reply format (`scripts/herdr-msg`).
 4. On delivery receipt: keep working locally or delegate the next independent slice. **Do not poll.**
-5. Aggregate replies from your own pane; ask follow-ups only for gaps.
+5. Aggregate replies from your own pane (ack sentinels / DONE bodies); ask follow-ups only for gaps.
 
 Example (parallel, no blocking):
 
@@ -167,10 +208,10 @@ Example (parallel, no blocking):
 herdr agent read reviewer --source recent-unwrapped --lines 40
 scripts/herdr-msg reviewer --task api-review <<'MSG'
 Review only src/api and tests touching it.
-Reply to reply-to with DONE, BLOCKED, or NEED-INPUT.
+Reply with DONE, BLOCKED, or NEED-INPUT.
 Include files reviewed and commands run.
 MSG
-# Receipt printed → continue local work. Collect kind:reply task:api-review on SELF later.
+# Receipt has reply_fields → continue local work; collect ack on SELF later.
 ```
 
 Example (need result before next step):
@@ -178,7 +219,7 @@ Example (need result before next step):
 ```bash
 scripts/herdr-msg reviewer --task api-review --wait-reply --timeout 120000 <<'MSG'
 Review only src/api and tests touching it.
-Reply to reply-to with DONE, BLOCKED, or NEED-INPUT.
+Reply with DONE, BLOCKED, or NEED-INPUT.
 MSG
 ```
 
@@ -206,4 +247,8 @@ For tests, wait for a test-framework marker such as `test result`, `passed`, `fa
 - If an agent is already working, keep the message short and say whether it should answer now or after its current step.
 - Long diffs or logs should be written to a shared file path and referenced in the message rather than pasted into a live prompt.
 - If a wait times out, immediately read **the pane you were waiting on** (usually SELF) once and decide from observed output. Do not extend timeouts blindly and do not start polling the worker.
-- `scripts/herdr-msg --verify` proves delivery, not task completion. `--wait-reply` blocks on SELF for `kind:reply task:<id>`.
+- Machine sync = **sentinels + msg_id**. Header matching is fragile/deprecated (`--legacy-wait-header` **replaces** sentinel wait, it does not add to it).
+- Receipts intentionally omit raw `<<<herdr-msg:...>>>` tokens; use `reply_fields` / `--wait-reply`.
+- `--verify` is optional observation of the outbound sentinel, not delivery and not task completion.
+- Empty message bodies are rejected unless `--allow-empty` is set. Body first line must be the exact expected sentinel if it looks like a sentinel at all.
+- Do not `kind=request` or `--wait-reply` to your own pane unless `--allow-self-target` (outbound ack instructions would false-match).

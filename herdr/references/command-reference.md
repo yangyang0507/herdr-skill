@@ -183,72 +183,119 @@ herdr pane report-metadata <pane-id> --source <id> --title "api review" --custom
 
 ## `scripts/herdr-msg`
 
-Preferred agent-to-agent transport. Resolves the target agent/pane, builds a structured header, and submits with `herdr pane run`.
+Preferred agent-to-agent transport. Resolves the target agent/pane, builds a human header plus machine **sentinels**, and submits with `herdr pane run`.
 
 ```bash
 scripts/herdr-msg <target> [--kind request|reply|update] [--task id] [--status text] \
-  [--verify] [--wait-reply] [--timeout MS] [--verify-timeout MS] [--dry-run] [--quiet] \
-  [--] [message...]
+  [--msg-id id] [--ack-of MSGID] [--verify] [--wait-reply] [--timeout MS] \
+  [--verify-timeout MS] [--legacy-wait-header] [--allow-self-target] \
+  [--allow-empty] [--dry-run] [--quiet] [--] [message...]
 ```
 
-Message body may be argv or stdin.
+Message body may be argv or stdin. Empty/whitespace-only bodies exit `2` unless `--allow-empty`.
+
+Machine sentinels (first body line; fixed-string match; unique `MSGID`):
+
+```text
+<<<herdr-msg:v1:send:TASK:MSGID>>>
+<<<herdr-msg:v1:ack:TASK:MSGID>>>
+```
+
+Field rules: `TASK` / `MSGID` are `[A-Za-z0-9_-]`, task max 32, msg-id max 16. Invalid `--task` / `--msg-id` / `--ack-of` exit `2` (no silent rewrite). Keeps lines short so terminals do not wrap tokens.
+
+The `[herdr-msg id:MSGID ...]` header is human metadata only. Do not use headers for waits.
 
 | Flag | Meaning |
 |------|---------|
-| `--verify` | After send, confirm the task marker appears once on the **target** pane. Delivery only, not completion. |
-| `--wait-reply` | After send, block on **SELF** until `kind:reply task:<id>` appears. |
+| `--kind` | Must be `request`, `reply`, or `update` (default `request`). |
+| `--msg-id` | Message id (default auto-generated). Rejected if invalid. |
+| `--ack-of` | With `--kind reply`, emit ack for this send `MSGID`. |
+| `--verify` | After send, try to **observe** the outbound sentinel on the **target**. Not delivery; unobserved still exit `0` (`state=delivered-unobserved`). |
+| `--wait-reply` | After send, block on **SELF** for the **ack sentinel** (token held in memory; not printed in the pre-wait receipt). |
 | `--timeout MS` | Timeout for `--wait-reply` (default `60000`). |
 | `--verify-timeout MS` | Timeout for `--verify` (default `5000`). |
-| `--dry-run` | Resolve and print payload/receipt; do not send. |
+| `--legacy-wait-header` | **Replaces** sentinel wait with fragile header regex (does not combine). Deprecated. |
+| `--allow-self-target` | Allow target pane == SELF. Required for `--wait-reply` or `kind=request` to self; otherwise exit `2` (self-send embeds ack text that can false-match waits). |
+| `--allow-empty` | Allow empty/whitespace-only body. |
+| `--dry-run` | Resolve and print payload/receipt; do not send. Payload may contain live tokens. |
 | `--quiet` | Suppress the key=value receipt. |
 
-Receipt fields (stdout): `ok`, `state`, `task`, `kind`, `target`, `target_pane`, `from`, `reply_to`, `match`, `verified`, `hint`.
+Receipt fields (never include the exact waitable `<<<...>>>` string): `ok`, `state`, `task`, `kind`, `msg_id`, `ack_msg_id`, `target`, `target_pane`, `from`, `reply_to`, `outbound_fields`, `send_fields`, `reply_fields`, `match_mode`, `match_recipe`, `observed`, `verified` (alias of observed), `hint`.
+
+Reconstruct: `match = '<<<herdr-msg:' + reply_fields + '>>>'` (e.g. `reply_fields=v1:ack:TASK:MSGID`).
 
 | `state` | Meaning |
 |---------|---------|
-| `delivered` | Send succeeded; stop observing the target. |
-| `waiting-reply` | Send succeeded; currently waiting on SELF. |
-| `replied` | Structured reply observed on SELF. |
+| `delivered` | `pane run` succeeded; stop observing the target. |
+| `delivered-unobserved` | Delivered, but outbound sentinel not seen on target in time (still ok). |
+| `waiting-reply` | Delivered; waiting on SELF for ack (token not in this receipt). |
+| `replied` | Ack sentinel observed on SELF. |
 | `dry-run` | Nothing sent. |
-| `verify-failed` | Delivery not observed on target (exit `3`). |
-| `wait-timeout` | No reply on SELF in time (exit `4`). |
+| `wait-timeout` | No ack on SELF in time (exit `4`). |
 | `error` | Send/resolve failure (exit `1`). |
 
-Exit codes: `0` ok, `1` send/resolve fail, `2` usage/env, `3` verify failed, `4` wait-reply timeout.
+Exit codes: `0` ok (including delivered-unobserved), `1` send/resolve fail, `2` usage/env, `4` wait-reply timeout.
 
-**Do not** follow a successful send with a poll loop on the target (`agent read` / `pane read` repeatedly). Use `--wait-reply` or `herdr wait output` on `$HERDR_PANE_ID` with the printed `match` value.
+**Matching rules**
+
+- Default wait/verify use **short sentinel lines**, not headers.
+- Receipts **must not** print the exact wait token; otherwise `herdr wait output` on SELF false-matches the receipt.
+- `--wait-reply` matches in-memory `<<<herdr-msg:v1:ack:TASK:MSGID>>>` (fixed).
+- `--verify` matches outbound send/ack sentinel on the target.
+- If the body starts with any `<<<herdr-msg:v1:...>>>` line, it must equal the expected outbound sentinel exactly (else exit `2`).
+- Replies: `scripts/herdr-msg <reply-to> --kind reply --task TASK --ack-of MSGID` prepends the correct ack.
+- `kind=request` or `--wait-reply` to the **same pane as SELF** exits `2` unless `--allow-self-target` (prevents matching outbound ack instructions as a reply). Comparison uses **canonical** `pane_id` from `herdr pane get` / agent resolution, not the raw `HERDR_PANE_ID` string (which may be a terminal alias).
+
+**Do not** poll the target after a successful send. Prefer `--wait-reply`.
 
 Examples:
 
 ```bash
 # Deliver and stop
 scripts/herdr-msg reviewer --task api-review <<'MSG'
-Review src/api. Reply DONE or BLOCKED to reply-to.
+Review src/api. Reply DONE or BLOCKED.
 MSG
 
-# Deliver, verify once, stop
+# Deliver + optional observation of outbound sentinel
 scripts/herdr-msg reviewer --task api-review --verify <<'MSG'
 ...
 MSG
 
-# Deliver and wait on self for the reply
+# Deliver and wait on self (preferred; no token echo)
 scripts/herdr-msg reviewer --task api-review --wait-reply --timeout 120000 <<'MSG'
 ...
 MSG
+
+# Receiver reply (ack first line auto-prepended)
+scripts/herdr-msg "$REPLY_TO" --kind reply --task api-review --ack-of m1a2b3c4 --status done <<'MSG'
+DONE: findings...
+MSG
+
+# Manual wait from receipt reply_fields (do not echo full token first)
+RF=v1:ack:api-review:m1a2b3c4
+herdr wait output "$HERDR_PANE_ID" \
+  --match "<<<herdr-msg:${RF}>>>" \
+  --source recent-unwrapped --timeout 120000
 ```
 
 ## Message Transport Without The Helper
 
-If `scripts/herdr-msg` is unavailable, create a message manually and pass it as one argument:
+If `scripts/herdr-msg` is unavailable, create a message with header + sentinel and pass it as one argument:
 
 ```bash
 SELF=${HERDR_PANE_ID:-$(herdr pane list | sed -nE 's/.*\{[^{}]*"focused":true[^{}]*"pane_id":"([^"]+)".*/\1/p')}
 TARGET_PANE=$(herdr agent get reviewer | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
-MSG="[herdr-msg from:codex pane:$SELF reply-to:$SELF at:current kind:request task:review]
-Please review src/api. Reply to reply-to with DONE or BLOCKED."
+MSGID=m$(date +%s)
+TASK=review
+MSG="[herdr-msg id:$MSGID from:codex pane:$SELF reply-to:$SELF at:current kind:request task:$TASK]
+<<<herdr-msg:v1:send:${TASK}:${MSGID}>>>
+Please review src/api.
+When done, reply with first line exactly:
+<<<herdr-msg:v1:ack:${TASK}:${MSGID}>>>
+DONE or BLOCKED."
 herdr pane run "$TARGET_PANE" "$MSG"
-# DELIVERED. Do not poll TARGET_PANE. Wait on SELF if you need the reply:
-# herdr wait output "$SELF" --match "kind:reply task:review" --timeout 60000
+# DELIVERED. Do not poll TARGET_PANE. Wait on SELF:
+# herdr wait output "$SELF" --match "<<<herdr-msg:v1:ack:${TASK}:${MSGID}>>>" --timeout 60000
 ```
 
 Avoid shell one-liners with complex quoting. Use a variable, heredoc, or `scripts/herdr-msg` for multi-line messages.
