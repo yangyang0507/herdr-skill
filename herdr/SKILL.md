@@ -39,7 +39,7 @@ If `HERDR_ENV` is not `1`, do not control live panes unless the user asked you t
 ## After `herdr-msg` (mandatory)
 
 1. Non-zero exit → send/resolve failed; fix and resend. Do not poll.
-2. `state=delivered` (exit 0) → **stop**. Do not read the target in a loop. Do not block-wait.
+2. `state=delivered` (exit 0) → obey `hint` exactly: **stop**. Do not read the target in a loop. Do not block-wait.
 3. End your turn. The wake-up is the peer injecting a message into `reply-to` (your pane).
 4. Polling the target after send is a **protocol violation**.
 
@@ -94,7 +94,7 @@ Review src/auth.ts. Reply to reply-to with DONE or BLOCKED."
 
 Tiny key=value lines: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `hint`.
 
-Treat `state=delivered` as success. The `hint` says to end the turn.
+Treat `state=delivered` as success. Obey `hint` exactly (end the turn; do not inspect or re-enter the target).
 
 ## Waiting Policy
 

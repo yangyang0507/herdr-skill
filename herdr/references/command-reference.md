@@ -213,7 +213,7 @@ Receipt: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `en
 
 | `state` | Meaning |
 |---------|---------|
-| `delivered` | Submit accepted (`enter_nudge=1` if extra Enter was needed) → **end turn**. |
+| `delivered` | Submit accepted (`enter_nudge=1` if extra Enter was needed). Obey `hint`: **end turn**. |
 | `dry-run` | Nothing sent. |
 | `error` | Send/resolve failure (exit `1`). |
 

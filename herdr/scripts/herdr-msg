@@ -21,8 +21,8 @@ Default header (minimal):
 Optional: --kind request|reply|update (included in header when not "request")
   HERDR_AGENT_NAME / detected agent name adds from:<name> when available.
 
-After a successful send: stop. Do not poll the target. Do not block-wait.
-When the peer injects a reply into your pane, handle that inbound message.
+After a successful send: obey the receipt hint. Stop. Do not poll the target.
+Do not block-wait. When the peer injects a reply into your pane, handle it.
 
 Options:
   --task id          Human thread label (default: general)
@@ -386,25 +386,29 @@ if [[ "$target_pane_id" == "$canonical_self" && "$kind" == "request" && "$allow_
   exit 2
 fi
 
-receipt_hint="End turn. Do not poll the target. Do not block-wait. Handle the inbound reply when it is injected into your pane."
-
 if [[ "$dry_run" -eq 1 ]]; then
   if [[ "$quiet" -eq 0 ]]; then
     printf 'payload<<EOF\n%s\nEOF\n' "$payload"
   fi
-  receipt_hint="DRY-RUN only. Nothing was sent. ${receipt_hint}"
+  receipt_hint="DRY-RUN only. Nothing was sent. Do not contact the target."
   print_receipt "dry-run"
   exit 0
 fi
 
 if ! herdr pane run "$target_pane_id" "$payload"; then
   echo "error: herdr pane run failed for target pane: $target_pane_id" >&2
-  receipt_hint="SEND failed. Fix the target and resend. Do not poll."
+  receipt_hint="SEND failed. Fix the target and resend. Do not pane read or wait."
   print_receipt "error" || true
   exit 1
 fi
 
 ensure_target_started
+
+receipt_hint="STOP NOW. Delivered means the target already has the message and submit was checked."
+if [[ "$enter_nudge" -eq 1 ]]; then
+  receipt_hint="${receipt_hint} Extra Enter already sent."
+fi
+receipt_hint="${receipt_hint} End this turn. Do not pane read, agent wait, send-keys Enter, or resend. Handle the peer reply only when it is injected into this pane."
 
 print_receipt "delivered"
 exit 0
