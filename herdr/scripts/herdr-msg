@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Lightweight agent-to-agent messages for Herdr.
 # Default contract: deliver -> print small receipt -> stop / end turn.
+# After pane run, nudge Enter if an idle/done agent did not start.
 # No msg_id, sentinels, wait-reply, or verify. The peer push-replies into reply-to.
 
 usage() {
@@ -10,7 +11,8 @@ usage() {
 Usage: scripts/herdr-msg <target> [--task id] [--kind request|reply|update] [--] [message...]
 
 Sends a one-line herdr-msg header plus body to another Herdr agent/pane via
-`herdr pane run`, then exits. Message text may be argv or stdin.
+`herdr pane run`. If the target is an idle/done agent that does not start
+running, sends Enter once and exits. Message text may be argv or stdin.
 
 Default header (minimal):
   [herdr-msg reply-to:<self-pane> task:<task>]
@@ -31,7 +33,7 @@ Options:
   -h, --help         Show this help
 
 Receipt (stdout, unless --quiet):
-  ok state target target_pane reply_to task kind hint
+  ok state target target_pane reply_to task kind enter_nudge hint
 
 Exit codes:
   0  delivered (or dry-run)
@@ -65,6 +67,7 @@ kind="request"
 dry_run=0
 quiet=0
 allow_self=0
+enter_nudge=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -256,8 +259,66 @@ target_pane=${target_pane_id}
 reply_to=${reply_to}
 task=${task_value}
 kind=${kind}
+enter_nudge=${enter_nudge}
 hint=${receipt_hint}
 EOF
+}
+
+# pane run usually submits Enter, but agent composers sometimes keep the text
+# in the input box. Wait for working/blocked; if the target stays idle/done,
+# press Enter once. Do not wait for the peer's reply.
+readonly SUBMIT_CHECK_MS=5000
+readonly SUBMIT_RETRY_CHECK_MS=2000
+
+read_agent_status() {
+  local json
+  json=$(herdr agent get "$target_pane_id" 2>/dev/null || true)
+  json=$(strip_simple_agent_session "$json")
+  json_string_field "$json" agent_status
+}
+
+status_is_running() {
+  case "${1:-}" in
+    working|blocked) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+status_needs_enter() {
+  case "${1:-}" in
+    idle|done) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_until_running() {
+  herdr agent wait "$target_pane_id" --until working --until blocked --timeout "$1" >/dev/null 2>&1
+}
+
+send_submit_enter() {
+  herdr agent send-keys "$target_pane_id" Enter 2>/dev/null \
+    || herdr pane send-keys "$target_pane_id" Enter
+}
+
+ensure_target_started() {
+  local status
+  status=$(read_agent_status)
+  if [[ -z "$status" ]] || status_is_running "$status" || ! status_needs_enter "$status"; then
+    return 0
+  fi
+  if wait_until_running "$SUBMIT_CHECK_MS"; then
+    return 0
+  fi
+  status=$(read_agent_status)
+  if ! status_needs_enter "$status"; then
+    return 0
+  fi
+  if send_submit_enter; then
+    enter_nudge=1
+    wait_until_running "$SUBMIT_RETRY_CHECK_MS" || true
+  else
+    echo "error: fallback Enter failed for target pane: $target_pane_id" >&2
+  fi
 }
 
 info_json=$(herdr pane list)
@@ -342,6 +403,8 @@ if ! herdr pane run "$target_pane_id" "$payload"; then
   print_receipt "error" || true
   exit 1
 fi
+
+ensure_target_started
 
 print_receipt "delivered"
 exit 0

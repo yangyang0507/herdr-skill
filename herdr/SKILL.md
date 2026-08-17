@@ -92,7 +92,7 @@ Review src/auth.ts. Reply to reply-to with DONE or BLOCKED."
 
 ### Receipt
 
-Tiny key=value lines: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `hint`.
+Tiny key=value lines: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `hint`.
 
 Treat `state=delivered` as success. The `hint` says to end the turn.
 
@@ -131,7 +131,7 @@ For tests, wait for framework markers (`passed`, `failed`, `FAIL`, …) or run t
 
 ## Gotchas
 
-- `pane run` submits with Enter; `agent send` does not.
+- `pane run` submits with Enter; `agent send` does not. `herdr-msg` checks the target after `pane run` and sends Enter if an idle/done agent did not start (`working`/`blocked`).
 - `recent-unwrapped` is better than `recent` when matching command output.
 - Herdr sets `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH` in panes.
 - Long diffs/logs: write a file path into the message; do not paste huge blobs into the peer prompt.

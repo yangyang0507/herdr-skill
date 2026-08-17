@@ -183,7 +183,7 @@ herdr pane report-metadata <pane-id> --source <id> --title "api review" --custom
 
 ## `scripts/herdr-msg`
 
-Lightweight agent-to-agent transport. Resolves the target, autofills `reply-to` from SELF, prepends a one-line header, submits with `herdr pane run`, prints a tiny receipt, and exits.
+Lightweight agent-to-agent transport. Resolves the target, autofills `reply-to` from SELF, prepends a one-line header, submits with `herdr pane run`, and if an idle/done agent does not become `working`/`blocked`, sends Enter once. Then prints a tiny receipt and exits.
 
 ```bash
 scripts/herdr-msg <target> [--task id] [--kind request|reply|update] \
@@ -209,11 +209,11 @@ Default payload:
 | `--dry-run` | Print payload + receipt; do not send. |
 | `--quiet` | Suppress receipt. |
 
-Receipt: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `hint`.
+Receipt: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `hint`.
 
 | `state` | Meaning |
 |---------|---------|
-| `delivered` | `pane run` succeeded → **end turn**. |
+| `delivered` | Submit accepted (`enter_nudge=1` if extra Enter was needed) → **end turn**. |
 | `dry-run` | Nothing sent. |
 | `error` | Send/resolve failure (exit `1`). |
 
@@ -240,6 +240,7 @@ SELF=$HERDR_PANE_ID
 TARGET=$(herdr agent get reviewer | sed -nE 's/.*"pane_id":"([^"]+)".*/\1/p')
 herdr pane run "$TARGET" "[herdr-msg reply-to:$SELF task:review]
 Please review src/api. Reply to reply-to with DONE or BLOCKED."
+# Prefer scripts/herdr-msg: it sends Enter if the target stays idle.
 # End turn. Do not poll TARGET.
 ```
 
