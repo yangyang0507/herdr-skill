@@ -1,6 +1,6 @@
 ---
 name: herdr
-description: Use this skill when running inside Herdr to coordinate workspaces, tabs, panes, sibling agents, server/test/log panes, agent-to-agent messages, or multi-agent delegation. Send a lightweight herdr-msg (reply-to + task), then stop and end the turn. Do not poll siblings and do not block-wait for replies; handle the peer message when it is injected into your pane.
+description: Use this skill when running inside Herdr to coordinate workspaces, tabs, panes, sibling agents, server/test/log panes, agent-to-agent messages, or multi-agent delegation. Send a lightweight herdr-msg (reply-to + task). On delivered, stop. On unconfirmed, send Enter once then stop. Do not poll siblings and do not block-wait for replies; handle the peer message when it is injected into your pane.
 ---
 
 # Herdr
@@ -25,7 +25,7 @@ If `HERDR_ENV` is not `1`, do not control live panes unless the user asked you t
 - Prefer `HERDR_PANE_ID` as your pane handle when set.
 - For agent task handoff use `scripts/herdr-msg` or `herdr pane run` (not `herdr agent send` alone — it does not press Enter).
 - Read a target **once** before sending, only to avoid interrupting a prompt/approval.
-- **After send: stop.** Do not poll the target. Do not `herdr wait` / `--wait-reply` for normal chat. End your turn. When a reply is injected into **your** pane, handle that inbound message.
+- **After send:** `herdr-msg` checks the target once. `state=delivered` → stop. `state=unconfirmed` → send Enter once to `target_pane`, then stop. Do not poll. Do not `herdr wait` / `--wait-reply` for normal chat. When a reply is injected into **your** pane, handle that inbound message.
 - Do not use `herdr wait agent-status ... --status done` for multi-agent coordination.
 
 ## Default Loop
@@ -33,15 +33,18 @@ If `HERDR_ENV` is not `1`, do not control live panes unless the user asked you t
 1. Discover agents/panes.
 2. Read the target **once** if needed.
 3. Send a short request with `scripts/herdr-msg` (header carries **reply-to** + **task**).
-4. On `state=delivered`: **end the turn** (or do unrelated local work that does not depend on the reply).
+4. On `state=delivered`: **end the turn**. On `state=unconfirmed`: send Enter once to `target_pane`, then end the turn.
 5. When an inbound reply appears in your pane, integrate it.
 
 ## After `herdr-msg` (mandatory)
 
 1. Non-zero exit → send/resolve failed; fix and resend. Do not poll.
-2. `state=delivered` (exit 0) → obey `hint` exactly: **stop**. Do not read the target in a loop. Do not block-wait.
-3. End your turn. The wake-up is the peer injecting a message into `reply-to` (your pane).
-4. Polling the target after send is a **protocol violation**.
+2. `state=delivered` (exit 0) → obey `hint`: **stop**. Helper already checked once.
+3. `state=unconfirmed` (exit 0) → send Enter once, then **stop**:
+   `herdr agent send-keys "$target_pane" Enter`
+   Do not pane read. Do not wait. Do not resend. Do not loop.
+4. The wake-up is the peer injecting a message into `reply-to` (your pane).
+5. Polling the target after the one allowed Enter is a **protocol violation**.
 
 ## Lightweight agent messages
 
@@ -70,7 +73,7 @@ scripts/herdr-msg codex --task auth-review <<'MSG'
 Review src/auth.ts for auth bypasses and missing tests.
 Reply to reply-to with DONE or BLOCKED findings.
 MSG
-# receipt: state=delivered → end turn
+# receipt: delivered → end turn; unconfirmed → Enter once, then end turn
 ```
 
 ### Reply
@@ -92,9 +95,9 @@ Review src/auth.ts. Reply to reply-to with DONE or BLOCKED."
 
 ### Receipt
 
-Tiny key=value lines: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `hint`.
+Tiny key=value lines: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `target_status`, `hint`.
 
-Treat `state=delivered` as success. Obey `hint` exactly (end the turn; do not inspect or re-enter the target).
+`delivered` = helper saw `working`/`blocked` (or no agent). `unconfirmed` = still `idle`/`done` after the check — Enter once, then stop.
 
 ## Waiting Policy
 
@@ -114,7 +117,7 @@ Only use `herdr agent wait` / `wait agent-status` when the user explicitly needs
 1. `herdr agent list`
 2. Read target once.
 3. `scripts/herdr-msg <target> --task <label> <<'MSG' ... MSG`
-4. On delivered: **end turn** (or unrelated local work). No poll, no block-wait.
+4. On delivered: **end turn**. On unconfirmed: Enter once, then end turn. No poll, no block-wait.
 5. When replies arrive on your pane, integrate; follow up only for gaps.
 
 ## Server And Test Panes
@@ -131,7 +134,7 @@ For tests, wait for framework markers (`passed`, `failed`, `FAIL`, …) or run t
 
 ## Gotchas
 
-- `pane run` submits with Enter; `agent send` does not. `herdr-msg` checks the target after `pane run` and sends Enter if an idle/done agent did not start (`working`/`blocked`).
+- `pane run` submits with Enter; `agent send` does not. `herdr-msg` checks the target once after send and reports `target_status`. If still idle, receipt is `unconfirmed`.
 - `recent-unwrapped` is better than `recent` when matching command output.
 - Herdr sets `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH` in panes.
 - Long diffs/logs: write a file path into the message; do not paste huge blobs into the peer prompt.

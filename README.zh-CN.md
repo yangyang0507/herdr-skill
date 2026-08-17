@@ -57,8 +57,8 @@ Please review src/api. Reply DONE or BLOCKED to reply-to.
 1. 解析目标 agent/pane；
 2. 自动填 `reply-to`；
 3. `herdr pane run` 发出；
-4. 若目标是 idle/done 的 agent 且没有开始运行，再补一次 Enter；
-5. 打印小回执（`state=delivered`，`hint` 要求立刻结束本轮、不要再碰目标）；
+4. 发送后检查一次；若目标仍是 idle/done，补 Enter 再检查一次；
+5. 打印回执（`delivered` 或 `unconfirmed`，以及 `target_status`）；
 6. 退出。
 
 默认 **没有** msg_id、sentinel、`--verify`、`--wait-reply`。那些是为机器阻塞匹配准备的；日常聊天用「对方 push 进你的 pane」即可。
@@ -69,4 +69,4 @@ Review the lightweight protocol.
 MSG
 ```
 
-发送后协议：**送达 → 停止 → 结束本轮 → 处理 inbound 回信**。
+发送后协议：**发送 → 检查一次 → delivered 则停止，unconfirmed 则补一次 Enter 再停止**。

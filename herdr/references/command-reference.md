@@ -183,7 +183,7 @@ herdr pane report-metadata <pane-id> --source <id> --title "api review" --custom
 
 ## `scripts/herdr-msg`
 
-Lightweight agent-to-agent transport. Resolves the target, autofills `reply-to` from SELF, prepends a one-line header, submits with `herdr pane run`, and if an idle/done agent does not become `working`/`blocked`, sends Enter once. Then prints a tiny receipt and exits.
+Lightweight agent-to-agent transport. Resolves the target, autofills `reply-to` from SELF, prepends a one-line header, submits with `herdr pane run`, checks the target once, and if an idle/done agent does not become `working`/`blocked`, sends Enter and checks again. Then prints a tiny receipt and exits.
 
 ```bash
 scripts/herdr-msg <target> [--task id] [--kind request|reply|update] \
@@ -209,17 +209,18 @@ Default payload:
 | `--dry-run` | Print payload + receipt; do not send. |
 | `--quiet` | Suppress receipt. |
 
-Receipt: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `hint`.
+Receipt: `ok`, `state`, `target`, `target_pane`, `reply_to`, `task`, `kind`, `enter_nudge`, `target_status`, `hint`.
 
 | `state` | Meaning |
 |---------|---------|
-| `delivered` | Submit accepted (`enter_nudge=1` if extra Enter was needed). Obey `hint`: **end turn**. |
+| `delivered` | Check saw `working`/`blocked` (or no agent). Obey `hint`: **end turn**. |
+| `unconfirmed` | Still `idle`/`done` after the check. Send Enter once to `target_pane`, then **end turn**. |
 | `dry-run` | Nothing sent. |
 | `error` | Send/resolve failure (exit `1`). |
 
-Exit codes: `0` delivered/dry-run, `1` send/resolve fail, `2` usage/env/empty/self-target.
+Exit codes: `0` delivered/unconfirmed/dry-run, `1` send/resolve fail, `2` usage/env/empty/self-target.
 
-**Contract:** deliver → stop → end turn. Do not poll the target. Do not block-wait. Handle the inbound reply when it is injected into your pane.
+**Contract:** send → check once → delivered/stop, or unconfirmed/Enter-once/stop. Do not poll. Do not block-wait. Handle the inbound reply when it is injected into your pane.
 
 Examples:
 

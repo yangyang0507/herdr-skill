@@ -59,8 +59,8 @@ Please review src/api. Reply DONE or BLOCKED to reply-to.
 1. resolves the target agent/pane;
 2. autofills `reply-to` from SELF;
 3. sends via `herdr pane run`;
-4. if the target is an idle/done agent that does not start, sends Enter once;
-5. prints a tiny receipt (`state=delivered`, `hint` tells the sender to stop);
+4. checks the target once; if an idle/done agent did not start, sends Enter and re-checks;
+5. prints a receipt (`delivered` or `unconfirmed`, plus `target_status`);
 6. exits.
 
 There is no default `msg_id`, sentinel, `--verify`, or `--wait-reply`. Those were useful for machine wait-matching; for day-to-day chat they add weight without helping the natural “push reply into my pane” wake-up.
@@ -71,4 +71,4 @@ Review the lightweight protocol.
 MSG
 ```
 
-Post-send protocol: **deliver → stop → end turn → handle inbound reply**.
+Post-send protocol: **send → check once → delivered/stop, or unconfirmed/Enter-once/stop**.

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Lightweight agent-to-agent messages for Herdr.
-# Default contract: deliver -> print small receipt -> stop / end turn.
-# After pane run, nudge Enter if an idle/done agent did not start.
+# Default contract: send -> check once -> receipt -> stop / end turn.
+# After pane run, if an idle/done agent did not start, send Enter and re-check.
 # No msg_id, sentinels, wait-reply, or verify. The peer push-replies into reply-to.
 
 usage() {
@@ -11,8 +11,8 @@ usage() {
 Usage: scripts/herdr-msg <target> [--task id] [--kind request|reply|update] [--] [message...]
 
 Sends a one-line herdr-msg header plus body to another Herdr agent/pane via
-`herdr pane run`. If the target is an idle/done agent that does not start
-running, sends Enter once and exits. Message text may be argv or stdin.
+`herdr pane run`, then checks the target once. If an idle/done agent did not
+start, sends Enter and re-checks. Message text may be argv or stdin.
 
 Default header (minimal):
   [herdr-msg reply-to:<self-pane> task:<task>]
@@ -21,8 +21,8 @@ Default header (minimal):
 Optional: --kind request|reply|update (included in header when not "request")
   HERDR_AGENT_NAME / detected agent name adds from:<name> when available.
 
-After a successful send: obey the receipt hint. Stop. Do not poll the target.
-Do not block-wait. When the peer injects a reply into your pane, handle it.
+After send: obey the receipt. state=delivered → stop. state=unconfirmed →
+send Enter once to target_pane, then stop. Do not poll or loop.
 
 Options:
   --task id          Human thread label (default: general)
@@ -33,10 +33,10 @@ Options:
   -h, --help         Show this help
 
 Receipt (stdout, unless --quiet):
-  ok state target target_pane reply_to task kind enter_nudge hint
+  ok state target target_pane reply_to task kind enter_nudge target_status hint
 
 Exit codes:
-  0  delivered (or dry-run)
+  0  delivered, unconfirmed, or dry-run
   1  send / resolve failure
   2  usage / environment / self-target refuse / empty body
 EOF
@@ -68,6 +68,7 @@ dry_run=0
 quiet=0
 allow_self=0
 enter_nudge=0
+target_status=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -260,13 +261,14 @@ reply_to=${reply_to}
 task=${task_value}
 kind=${kind}
 enter_nudge=${enter_nudge}
+target_status=${target_status}
 hint=${receipt_hint}
 EOF
 }
 
 # pane run usually submits Enter, but agent composers sometimes keep the text
-# in the input box. Wait for working/blocked; if the target stays idle/done,
-# press Enter once. Do not wait for the peer's reply.
+# in the input box. After send, check once for working/blocked; if the target
+# stays idle/done, press Enter and check again. Do not wait for the peer reply.
 readonly SUBMIT_CHECK_MS=5000
 readonly SUBMIT_RETRY_CHECK_MS=2000
 
@@ -303,21 +305,37 @@ send_submit_enter() {
 ensure_target_started() {
   local status
   status=$(read_agent_status)
+  target_status="$status"
   if [[ -z "$status" ]] || status_is_running "$status" || ! status_needs_enter "$status"; then
     return 0
   fi
   if wait_until_running "$SUBMIT_CHECK_MS"; then
+    target_status=$(read_agent_status)
     return 0
   fi
   status=$(read_agent_status)
+  target_status="$status"
   if ! status_needs_enter "$status"; then
     return 0
   fi
   if send_submit_enter; then
     enter_nudge=1
     wait_until_running "$SUBMIT_RETRY_CHECK_MS" || true
+    target_status=$(read_agent_status)
   else
     echo "error: fallback Enter failed for target pane: $target_pane_id" >&2
+  fi
+}
+
+# One mandatory post-send check. If still idle/done, Enter once more and re-read.
+verify_target_once() {
+  if ! status_needs_enter "$target_status"; then
+    return 0
+  fi
+  if send_submit_enter; then
+    enter_nudge=1
+    wait_until_running "$SUBMIT_RETRY_CHECK_MS" || true
+    target_status=$(read_agent_status)
   fi
 }
 
@@ -403,12 +421,14 @@ if ! herdr pane run "$target_pane_id" "$payload"; then
 fi
 
 ensure_target_started
+verify_target_once
 
-receipt_hint="STOP NOW. Delivered means the target already has the message and submit was checked."
-if [[ "$enter_nudge" -eq 1 ]]; then
-  receipt_hint="${receipt_hint} Extra Enter already sent."
+if status_is_running "$target_status" || [[ -z "$target_status" ]]; then
+  receipt_hint="STOP NOW. Delivered (target_status=${target_status:-none}). Submit was checked. End this turn. Do not pane read, agent wait, send-keys Enter, or resend. Handle the peer reply only when it is injected into this pane."
+  print_receipt "delivered"
+  exit 0
 fi
-receipt_hint="${receipt_hint} End this turn. Do not pane read, agent wait, send-keys Enter, or resend. Handle the peer reply only when it is injected into this pane."
 
-print_receipt "delivered"
+receipt_hint="UNCONFIRMED. target_status=${target_status}. Send Enter once (herdr agent send-keys ${target_pane_id} Enter) then END THIS TURN. Do not pane read, do not wait, do not resend, do not loop."
+print_receipt "unconfirmed"
 exit 0
